@@ -6,9 +6,13 @@ from simple_salesforce.format import format_soql
 from app.core.salesforce import get_salesforce
 
 
+# ==========================================
+# Get Admission Application
+# ==========================================
+
 def get_customer_by_application_no(application_no: str):
     """
-    Find a Customer admission record using Application_No__c.
+    Find the Customer record representing the admission application.
     """
 
     sf = get_salesforce()
@@ -33,6 +37,10 @@ def get_customer_by_application_no(application_no: str):
     return result["records"][0]
 
 
+# ==========================================
+# Create Document
+# ==========================================
+
 def create_document(
     customer_id: str,
     file_name: str,
@@ -42,17 +50,18 @@ def create_document(
     description: str | None = None,
 ):
     """
-    Upload a document to Salesforce ContentVersion.
+    Upload one completed document to Salesforce ContentVersion.
+
+    File chunking and reassembly are handled by the service layer
+    before this function is called.
     """
 
     sf = get_salesforce()
 
-    # Convert file bytes to base64 for Salesforce
+    # Encode the completed file for Salesforce
     encoded_file = base64.b64encode(file_content).decode("utf-8")
 
-    # Example:
-    # file_name = "admission_call.mp3"
-    # title = "admission_call"
+    # Example: admission_call.mp3 -> admission_call
     title = Path(file_name).stem
 
     content_version_data = {
@@ -60,24 +69,29 @@ def create_document(
         "PathOnClient": file_name,
         "VersionData": encoded_file,
 
-        # Link document to Customer admission application
+        # Connect the document to the admission application
         "Application__c": customer_id,
         "FirstPublishLocationId": customer_id,
 
-        # Custom document metadata
+        # Document metadata
         "Document_Type__c": document_type,
         "Source__c": source,
     }
 
+    # Add description only when provided
     if description:
         content_version_data["Description"] = description
 
     return sf.ContentVersion.create(content_version_data)
 
 
+# ==========================================
+# Get Document Metadata
+# ==========================================
+
 def get_document_by_id(content_version_id: str):
     """
-    Get uploaded document metadata from Salesforce.
+    Get metadata for an uploaded Salesforce document.
     """
 
     sf = get_salesforce()
