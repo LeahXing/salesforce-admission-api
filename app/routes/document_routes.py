@@ -7,6 +7,7 @@ from app.services.document_service import (
 )
 
 
+# Create router for admission document endpoints
 router = APIRouter(
     prefix="/admissions",
     tags=["Admission Documents"],
@@ -27,7 +28,12 @@ async def initialize_upload(
     source: str = Form(...),
     description: str | None = Form(None),
 ):
+    """
+    Start a new document upload session and generate an upload_id.
+    """
+
     try:
+        # Validate file metadata
         if not file_name:
             raise HTTPException(
                 status_code=400,
@@ -46,6 +52,7 @@ async def initialize_upload(
                 detail="Total chunks must be greater than 0.",
             )
 
+        # Create the upload session
         return initialize_document_upload(
             application_no=application_no,
             file_name=file_name,
@@ -85,9 +92,15 @@ async def upload_chunk(
     chunk_number: int = Form(...),
     file: UploadFile = File(...),
 ):
+    """
+    Receive and temporarily store one chunk of the document.
+    """
+
     try:
+        # Read the current chunk
         chunk_content = await file.read()
 
+        # Validate the chunk
         if chunk_number <= 0:
             raise HTTPException(
                 status_code=400,
@@ -100,6 +113,7 @@ async def upload_chunk(
                 detail="Uploaded chunk is empty.",
             )
 
+        # Save the chunk to the upload session
         return upload_document_chunk(
             application_no=application_no,
             upload_id=upload_id,
@@ -134,7 +148,13 @@ async def complete_upload(
     application_no: str,
     upload_id: str,
 ):
+    """
+    Verify all chunks, reassemble the file,
+    and upload the completed document to Salesforce.
+    """
+
     try:
+        # Complete the upload and create one Salesforce document
         return complete_document_upload(
             application_no=application_no,
             upload_id=upload_id,
