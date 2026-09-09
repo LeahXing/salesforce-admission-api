@@ -1,9 +1,14 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
+from app.schemas.document_schema import (
+    DocumentVerificationUpdate,
+)
+
 from app.services.document_service import (
     initialize_document_upload,
     upload_document_chunk,
     complete_document_upload,
+    verify_document,
 )
 
 
@@ -26,10 +31,10 @@ async def initialize_upload(
     total_chunks: int = Form(...),
     document_type: str = Form(...),
     source: str = Form(...),
-    description: str | None = Form(None),
 ):
     """
-    Start a new document upload session and generate an upload_id.
+    Start a new document upload session
+    and generate an upload_id.
     """
 
     try:
@@ -52,7 +57,7 @@ async def initialize_upload(
                 detail="Total chunks must be greater than 0.",
             )
 
-        # Create the upload session
+        # Create upload session
         return initialize_document_upload(
             application_no=application_no,
             file_name=file_name,
@@ -60,7 +65,6 @@ async def initialize_upload(
             total_chunks=total_chunks,
             document_type=document_type,
             source=source,
-            description=description,
         )
 
     except ValueError as e:
@@ -93,14 +97,15 @@ async def upload_chunk(
     file: UploadFile = File(...),
 ):
     """
-    Receive and temporarily store one chunk of the document.
+    Receive and temporarily store one chunk
+    of the document.
     """
 
     try:
         # Read the current chunk
         chunk_content = await file.read()
 
-        # Validate the chunk
+        # Validate chunk
         if chunk_number <= 0:
             raise HTTPException(
                 status_code=400,
@@ -113,7 +118,7 @@ async def upload_chunk(
                 detail="Uploaded chunk is empty.",
             )
 
-        # Save the chunk to the upload session
+        # Save chunk
         return upload_document_chunk(
             application_no=application_no,
             upload_id=upload_id,
@@ -154,10 +159,53 @@ async def complete_upload(
     """
 
     try:
-        # Complete the upload and create one Salesforce document
         return complete_document_upload(
             application_no=application_no,
             upload_id=upload_id,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+
+# ==========================================
+# 4. Update Document Verification
+# ==========================================
+
+@router.patch(
+    "/documents/{document_id}/verification"
+)
+async def update_document_verification(
+    document_id: str,
+    verification: DocumentVerificationUpdate,
+):
+    """
+    Update document verification status.
+
+    Supported statuses:
+    - Pending
+    - Verified
+    - Rejected
+    """
+
+    try:
+        return verify_document(
+            content_version_id=document_id,
+            verification_status=verification.verification_status,
+            rejection_reason=verification.rejection_reason,
+            verified_by=verification.verified_by,
         )
 
     except ValueError as e:
