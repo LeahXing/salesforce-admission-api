@@ -1,3 +1,7 @@
+# ==========================================
+# Salesforce Document Repository
+# ==========================================
+
 import base64
 from pathlib import Path
 
@@ -7,12 +11,15 @@ from app.core.salesforce import get_salesforce
 
 
 # ==========================================
-# Get Admission Application
+# 1. Get Admission Application
 # ==========================================
 
-def get_customer_by_application_no(application_no: str):
+def get_customer_by_application_no(
+    application_no: str,
+):
     """
-    Find the Customer record representing the admission application.
+    Find the Customer record representing
+    the admission application.
     """
 
     sf = get_salesforce()
@@ -38,62 +45,61 @@ def get_customer_by_application_no(application_no: str):
 
 
 # ==========================================
-# Create Document
+# 2. Get Documents by Application
 # ==========================================
 
-def create_document(
+def get_documents_by_application(
     customer_id: str,
-    file_name: str,
-    file_content: bytes,
-    document_type: str,
-    source: str,
 ):
     """
-    Upload one completed document to Salesforce ContentVersion.
-
-    File chunking and reassembly are handled by the service layer
-    before this function is called.
+    Get all uploaded documents belonging
+    to one admission application.
     """
 
     sf = get_salesforce()
 
-    # Encode completed file for Salesforce
-    encoded_file = base64.b64encode(
-        file_content
-    ).decode("utf-8")
+    query = format_soql(
+        """
+        SELECT
+            Id,
+            ContentDocumentId,
+            Title,
+            PathOnClient,
+            FileExtension,
+            ContentSize,
+            CreatedDate,
 
-    # Example:
-    # transcript.pdf -> transcript
-    title = Path(file_name).stem
+            Application__c,
+            Document_Type__c,
+            Source__c,
 
-    content_version_data = {
-        "Title": title,
-        "PathOnClient": file_name,
-        "VersionData": encoded_file,
+            Verification_Status__c,
+            Rejection_Reason__c,
+            Verified_By__c,
+            Verified_At__c
 
-        # Link document to admission application
-        "Application__c": customer_id,
-
-        # Document metadata
-        "Document_Type__c": document_type,
-        "Source__c": source,
-
-        # New documents start as Pending
-        "Verification_Status__c": "Pending",
-    }
-
-    return sf.ContentVersion.create(
-        content_version_data
+        FROM ContentVersion
+        WHERE Application__c = {}
+        ORDER BY CreatedDate DESC
+        """,
+        customer_id,
     )
 
+    result = sf.query_all(query)
+
+    return result["records"]
+
 
 # ==========================================
-# Get Document Metadata
+# 3. Get Document by ID
 # ==========================================
 
-def get_document_by_id(content_version_id: str):
+def get_document_by_id(
+    content_version_id: str,
+):
     """
-    Get metadata for one Salesforce document.
+    Get metadata for one Salesforce
+    ContentVersion record.
     """
 
     sf = get_salesforce()
@@ -134,7 +140,55 @@ def get_document_by_id(content_version_id: str):
 
 
 # ==========================================
-# Update Document Verification
+# 4. Create Document
+# ==========================================
+
+def create_document(
+    customer_id: str,
+    file_name: str,
+    file_content: bytes,
+    document_type: str,
+    source: str,
+):
+    """
+    Upload one completed document
+    to Salesforce ContentVersion.
+    """
+
+    sf = get_salesforce()
+
+    # Encode completed file for Salesforce
+    encoded_file = base64.b64encode(
+        file_content
+    ).decode("utf-8")
+
+    # Example:
+    # transcript.pdf -> transcript
+    title = Path(file_name).stem
+
+    content_version_data = {
+        "Title": title,
+        "PathOnClient": file_name,
+        "VersionData": encoded_file,
+
+        # Link document to Customer
+        "Application__c": customer_id,
+
+        # Document metadata
+        "Document_Type__c": document_type,
+        "Source__c": source,
+
+        # New documents start as Pending
+        "Verification_Status__c": "Pending",
+    }
+
+    return sf.ContentVersion.create(
+        content_version_data
+    )
+
+
+# ==========================================
+# 5. Update Document Verification
 # ==========================================
 
 def update_document_verification(
@@ -142,7 +196,8 @@ def update_document_verification(
     verification_data: dict,
 ):
     """
-    Update document verification fields.
+    Update verification fields
+    on a ContentVersion record.
     """
 
     sf = get_salesforce()
