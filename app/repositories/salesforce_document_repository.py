@@ -47,7 +47,6 @@ def create_document(
     file_content: bytes,
     document_type: str,
     source: str,
-    description: str | None = None,
 ):
     """
     Upload one completed document to Salesforce ContentVersion.
@@ -58,10 +57,13 @@ def create_document(
 
     sf = get_salesforce()
 
-    # Encode the completed file for Salesforce
-    encoded_file = base64.b64encode(file_content).decode("utf-8")
+    # Encode completed file for Salesforce
+    encoded_file = base64.b64encode(
+        file_content
+    ).decode("utf-8")
 
-    # Example: admission_call.mp3 -> admission_call
+    # Example:
+    # transcript.pdf -> transcript
     title = Path(file_name).stem
 
     content_version_data = {
@@ -69,20 +71,20 @@ def create_document(
         "PathOnClient": file_name,
         "VersionData": encoded_file,
 
-        # Connect the document to the admission application
+        # Link document to admission application
         "Application__c": customer_id,
-        "FirstPublishLocationId": customer_id,
 
         # Document metadata
         "Document_Type__c": document_type,
         "Source__c": source,
+
+        # New documents start as Pending
+        "Verification_Status__c": "Pending",
     }
 
-    # Add description only when provided
-    if description:
-        content_version_data["Description"] = description
-
-    return sf.ContentVersion.create(content_version_data)
+    return sf.ContentVersion.create(
+        content_version_data
+    )
 
 
 # ==========================================
@@ -91,7 +93,7 @@ def create_document(
 
 def get_document_by_id(content_version_id: str):
     """
-    Get metadata for an uploaded Salesforce document.
+    Get metadata for one Salesforce document.
     """
 
     sf = get_salesforce()
@@ -100,15 +102,22 @@ def get_document_by_id(content_version_id: str):
         """
         SELECT
             Id,
+            ContentDocumentId,
             Title,
             PathOnClient,
             FileExtension,
             ContentSize,
             CreatedDate,
-            Description,
+
+            Application__c,
             Document_Type__c,
             Source__c,
-            Application__c
+
+            Verification_Status__c,
+            Rejection_Reason__c,
+            Verified_By__c,
+            Verified_At__c
+
         FROM ContentVersion
         WHERE Id = {}
         LIMIT 1
@@ -122,3 +131,23 @@ def get_document_by_id(content_version_id: str):
         return None
 
     return result["records"][0]
+
+
+# ==========================================
+# Update Document Verification
+# ==========================================
+
+def update_document_verification(
+    content_version_id: str,
+    verification_data: dict,
+):
+    """
+    Update document verification fields.
+    """
+
+    sf = get_salesforce()
+
+    return sf.ContentVersion.update(
+        content_version_id,
+        verification_data,
+    )
