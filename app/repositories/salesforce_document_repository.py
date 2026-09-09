@@ -140,7 +140,40 @@ def get_document_by_id(
 
 
 # ==========================================
-# 4. Create Document
+# 4. Get Actual Document File Content
+# ==========================================
+
+def get_document_content(
+    content_version_id: str,
+):
+    """
+    Download the actual file content
+    from Salesforce VersionData.
+    """
+
+    sf = get_salesforce()
+
+    # Salesforce REST endpoint for the
+    # binary ContentVersion file
+    content_url = (
+        f"{sf.base_url}"
+        f"sobjects/ContentVersion/"
+        f"{content_version_id}/VersionData"
+    )
+
+    response = sf.session.get(
+        content_url,
+        headers=sf.headers,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    return response.content
+
+
+# ==========================================
+# 5. Create Document
 # ==========================================
 
 def create_document(
@@ -157,13 +190,10 @@ def create_document(
 
     sf = get_salesforce()
 
-    # Encode completed file for Salesforce
     encoded_file = base64.b64encode(
         file_content
     ).decode("utf-8")
 
-    # Example:
-    # transcript.pdf -> transcript
     title = Path(file_name).stem
 
     content_version_data = {
@@ -171,14 +201,13 @@ def create_document(
         "PathOnClient": file_name,
         "VersionData": encoded_file,
 
-        # Link document to Customer
+        # Link the document to Customer
         "Application__c": customer_id,
 
-        # Document metadata
         "Document_Type__c": document_type,
         "Source__c": source,
 
-        # New documents start as Pending
+        # New document starts as Pending
         "Verification_Status__c": "Pending",
     }
 
@@ -188,7 +217,7 @@ def create_document(
 
 
 # ==========================================
-# 5. Update Document Verification
+# 6. Update Document Verification
 # ==========================================
 
 def update_document_verification(
