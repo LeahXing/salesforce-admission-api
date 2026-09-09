@@ -63,7 +63,9 @@ def get_admission_application(application_id: str):
 @router.post("")
 def create_admission_application(admission: AdmissionCreate):
     try:
-        admission_data = admission.model_dump()
+        admission_data = admission.model_dump(
+            exclude_unset=True
+        )
 
         return register_admission(admission_data)
 
