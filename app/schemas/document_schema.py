@@ -46,13 +46,21 @@ class DocumentResponse(BaseModel):
     """
 
     document_id: str
+
+    application_id: Optional[str] = None
+
     file_name: str
     file_extension: Optional[str] = None
     file_size: Optional[int] = None
     upload_datetime: datetime
+
     document_type: str
     source: str
-    description: Optional[str] = None
+
+    verification_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
 
 
 # ==========================================
@@ -69,3 +77,18 @@ class UploadCompleteResponse(BaseModel):
     application_no: str
     status: str
     document: DocumentResponse
+
+
+# ==========================================
+# 5. Update Document Verification
+# ==========================================
+
+class DocumentVerificationUpdate(BaseModel):
+    """
+    Update the verification status of a document.
+    """
+
+    verification_status: str
+
+    rejection_reason: Optional[str] = None
+    verified_by: Optional[str] = None
