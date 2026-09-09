@@ -13,6 +13,7 @@ from app.repositories.salesforce_document_repository import (
     get_customer_by_application_no,
     get_documents_by_application,
     get_document_by_id,
+    get_document_content,
     create_document,
     update_document_verification,
 )
@@ -36,8 +37,8 @@ UPLOAD_DIR.mkdir(
 
 def format_document_response(document):
     """
-    Convert Salesforce ContentVersion fields
-    into API response fields.
+    Convert Salesforce fields into
+    API response fields.
     """
 
     return {
@@ -87,8 +88,8 @@ def list_documents(
     application_no: str,
 ):
     """
-    Get all uploaded documents for
-    one admission application.
+    Get all documents for one admission
+    application.
     """
 
     customer = get_customer_by_application_no(
@@ -119,8 +120,7 @@ def get_document(
     content_version_id: str,
 ):
     """
-    Get one uploaded document by
-    ContentVersion ID.
+    Get metadata for one document.
     """
 
     document = get_document_by_id(
@@ -139,7 +139,42 @@ def get_document(
 
 
 # ==========================================
-# 3. Initialize Document Upload
+# 3. Get Actual Document File
+# ==========================================
+
+def download_document(
+    content_version_id: str,
+):
+    """
+    Get the actual PDF/image content
+    and its metadata.
+    """
+
+    document = get_document_by_id(
+        content_version_id
+    )
+
+    if document is None:
+        raise ValueError(
+            f"Document {content_version_id} "
+            "was not found."
+        )
+
+    file_content = get_document_content(
+        content_version_id
+    )
+
+    return {
+        "file_content": file_content,
+        "file_name": document["PathOnClient"],
+        "file_extension": document.get(
+            "FileExtension"
+        ),
+    }
+
+
+# ==========================================
+# 4. Initialize Document Upload
 # ==========================================
 
 def initialize_document_upload(
@@ -225,7 +260,7 @@ def initialize_document_upload(
 
 
 # ==========================================
-# 4. Upload Document Chunk
+# 5. Upload Document Chunk
 # ==========================================
 
 def upload_document_chunk(
@@ -325,7 +360,7 @@ def upload_document_chunk(
 
 
 # ==========================================
-# 5. Complete Document Upload
+# 6. Complete Document Upload
 # ==========================================
 
 def complete_document_upload(
@@ -334,7 +369,7 @@ def complete_document_upload(
 ):
     """
     Reassemble all chunks and upload
-    one completed file to Salesforce.
+    completed file to Salesforce.
     """
 
     upload_path = (
@@ -372,10 +407,7 @@ def complete_document_upload(
         "total_chunks"
     ]
 
-    # --------------------------------------
-    # Check for missing chunks
-    # --------------------------------------
-
+    # Check missing chunks
     missing_chunks = []
 
     for chunk_number in range(
@@ -397,10 +429,7 @@ def complete_document_upload(
             f"Missing chunks: {missing_chunks}"
         )
 
-    # --------------------------------------
-    # Reassemble chunks
-    # --------------------------------------
-
+    # Reassemble file
     completed_file_path = (
         upload_path /
         "completed_file"
@@ -430,10 +459,7 @@ def complete_document_upload(
                     completed_file,
                 )
 
-    # --------------------------------------
-    # Verify final file size
-    # --------------------------------------
-
+    # Verify file size
     actual_file_size = (
         completed_file_path
         .stat()
@@ -450,26 +476,20 @@ def complete_document_upload(
     ):
         raise ValueError(
             "Completed file size does not "
-            "match the expected size. "
+            "match expected size. "
             f"Expected {expected_file_size} "
             f"bytes, received "
             f"{actual_file_size} bytes."
         )
 
-    # --------------------------------------
-    # Read completed file
-    # --------------------------------------
-
+    # Read final file
     with open(
         completed_file_path,
         "rb",
     ) as f:
         file_content = f.read()
 
-    # --------------------------------------
     # Upload to Salesforce
-    # --------------------------------------
-
     result = create_document(
         customer_id=metadata[
             "customer_id"
@@ -488,7 +508,6 @@ def complete_document_upload(
 
     content_version_id = result["id"]
 
-    # Get newly created document
     document = get_document_by_id(
         content_version_id
     )
@@ -499,7 +518,7 @@ def complete_document_upload(
         )
     )
 
-    # Remove temporary upload files
+    # Delete temporary files
     shutil.rmtree(
         upload_path
     )
@@ -513,7 +532,7 @@ def complete_document_upload(
 
 
 # ==========================================
-# 6. Update Document Verification
+# 7. Update Document Verification
 # ==========================================
 
 def verify_document(
@@ -523,7 +542,7 @@ def verify_document(
     verified_by: str | None = None,
 ):
     """
-    Change a document to:
+    Change document status to:
     Pending, Verified, or Rejected.
     """
 
@@ -542,7 +561,6 @@ def verify_document(
             "Pending, Verified, or Rejected."
         )
 
-    # Rejected documents require a reason
     if (
         verification_status == "Rejected"
         and not rejection_reason
@@ -552,7 +570,6 @@ def verify_document(
             "when a document is rejected."
         )
 
-    # Verify document exists
     document = get_document_by_id(
         content_version_id
     )
@@ -567,10 +584,6 @@ def verify_document(
         "Verification_Status__c":
             verification_status,
     }
-
-    # --------------------------------------
-    # Verified / Rejected
-    # --------------------------------------
 
     if verification_status in {
         "Verified",
@@ -589,33 +602,15 @@ def verify_document(
                 "Verified_By__c"
             ] = verified_by
 
-    # --------------------------------------
-    # Rejected
-    # --------------------------------------
-
-    if (
-        verification_status
-        == "Rejected"
-    ):
+    if verification_status == "Rejected":
         verification_data[
             "Rejection_Reason__c"
         ] = rejection_reason
 
-    # --------------------------------------
-    # Verified
-    # --------------------------------------
-
-    elif (
-        verification_status
-        == "Verified"
-    ):
+    elif verification_status == "Verified":
         verification_data[
             "Rejection_Reason__c"
         ] = None
-
-    # --------------------------------------
-    # Pending
-    # --------------------------------------
 
     else:
         verification_data[
