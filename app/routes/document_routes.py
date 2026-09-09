@@ -2,12 +2,15 @@
 # Document Routes
 # ==========================================
 
+import mimetypes
+
 from fastapi import (
     APIRouter,
     UploadFile,
     File,
     Form,
     HTTPException,
+    Response,
 )
 
 from app.schemas.document_schema import (
@@ -21,6 +24,7 @@ from app.schemas.document_schema import (
 from app.services.document_service import (
     list_documents,
     get_document,
+    download_document,
     initialize_document_upload,
     upload_document_chunk,
     complete_document_upload,
@@ -73,7 +77,7 @@ def get_application_documents(
 
 
 # ==========================================
-# 2. Get One Document
+# 2. Get One Document Metadata
 # ==========================================
 
 @router.get(
@@ -84,8 +88,7 @@ def get_admission_document(
     document_id: str,
 ):
     """
-    Get one document by Salesforce
-    ContentVersion ID.
+    Get metadata for one document.
     """
 
     try:
@@ -107,7 +110,67 @@ def get_admission_document(
 
 
 # ==========================================
-# 3. Initialize Document Upload
+# 3. Get Actual Document Content
+# ==========================================
+
+@router.get(
+    "/documents/{document_id}/content"
+)
+def view_document(
+    document_id: str,
+):
+    """
+    Return actual PDF/image content so the
+    frontend can display the document.
+    """
+
+    try:
+        document = download_document(
+            document_id
+        )
+
+        file_content = document[
+            "file_content"
+        ]
+
+        file_name = document[
+            "file_name"
+        ]
+
+        # Detect MIME type from filename
+        media_type, _ = mimetypes.guess_type(
+            file_name
+        )
+
+        if media_type is None:
+            media_type = (
+                "application/octet-stream"
+            )
+
+        return Response(
+            content=file_content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition":
+                    f'inline; filename="{file_name}"'
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=str(e),
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+
+# ==========================================
+# 4. Initialize Document Upload
 # ==========================================
 
 @router.post(
@@ -177,7 +240,7 @@ async def initialize_upload(
 
 
 # ==========================================
-# 4. Upload Document Chunk
+# 5. Upload Document Chunk
 # ==========================================
 
 @router.post(
@@ -238,7 +301,7 @@ async def upload_chunk(
 
 
 # ==========================================
-# 5. Complete Document Upload
+# 6. Complete Document Upload
 # ==========================================
 
 @router.post(
@@ -252,7 +315,7 @@ async def complete_upload(
 ):
     """
     Reassemble all chunks and upload
-    the completed document to Salesforce.
+    completed document to Salesforce.
     """
 
     try:
@@ -278,7 +341,7 @@ async def complete_upload(
 
 
 # ==========================================
-# 6. Update Document Verification
+# 7. Update Document Verification
 # ==========================================
 
 @router.patch(
