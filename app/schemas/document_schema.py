@@ -1,3 +1,7 @@
+# ==========================================
+# Document Schemas
+# ==========================================
+
 from datetime import datetime
 from typing import Optional
 
@@ -37,16 +41,15 @@ class ChunkUploadResponse(BaseModel):
 
 
 # ==========================================
-# 3. Document Information
+# 3. Document Response
 # ==========================================
 
 class DocumentResponse(BaseModel):
     """
-    Final document information stored in Salesforce.
+    Document metadata returned by the API.
     """
 
     document_id: str
-
     application_id: Optional[str] = None
 
     file_name: str
@@ -69,8 +72,8 @@ class DocumentResponse(BaseModel):
 
 class UploadCompleteResponse(BaseModel):
     """
-    Information returned after the complete document
-    is uploaded to Salesforce.
+    Information returned after the completed
+    document is uploaded to Salesforce.
     """
 
     upload_id: str
@@ -85,10 +88,9 @@ class UploadCompleteResponse(BaseModel):
 
 class DocumentVerificationUpdate(BaseModel):
     """
-    Update the verification status of a document.
+    Request body for document verification.
     """
 
     verification_status: str
-
     rejection_reason: Optional[str] = None
     verified_by: Optional[str] = None
