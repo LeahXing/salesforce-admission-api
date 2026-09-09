@@ -121,3 +121,5 @@ def delete_admission(application_id):
     result = sf.Customer.delete(application_id)
 
     return result
+
+#======== just testing ===========
