@@ -122,4 +122,4 @@ def delete_admission(application_id):
 
     return result
 
-#======== just testing ===========
+
