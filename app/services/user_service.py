@@ -5,8 +5,8 @@ from app.repositories.salesforce_user_repository import (
     create_user,
     get_user_by_id,
     update_user_status,
+    delete_user as delete_user_repository,
 )
-
 
 # ==========================================
 # Split Full Name
@@ -116,3 +116,20 @@ def update_user(data, user_id: str):
     )
 
     return format_user_response(updated_user)
+
+# ==========================================
+# Delete User
+# ==========================================
+
+def delete_user(user_id: str):
+    existing_user = get_user_by_id(user_id)
+
+    if existing_user is None:
+        raise ValueError("User not found.")
+
+    delete_user_repository(user_id)
+
+    return {
+        "message": "User deleted successfully.",
+        "userId": user_id,
+    }

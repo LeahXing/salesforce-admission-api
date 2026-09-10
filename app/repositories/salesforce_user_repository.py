@@ -120,3 +120,14 @@ def update_user_status(
     )
 
     return get_user_by_id(user_id)
+
+# ==========================================
+# Delete User
+# ==========================================
+
+def delete_user(user_id: str):
+    sf = get_salesforce()
+
+    sf.Customer.delete(user_id)
+
+    return True
