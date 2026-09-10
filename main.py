@@ -2,7 +2,7 @@ from fastapi import FastAPI
 
 from app.routes.admission_routes import router as admission_router
 from app.routes.document_routes import router as document_router
-
+from app.routes.user_routes import router as user_router
 
 # ============================================================
 # CREATE FASTAPI APPLICATION
@@ -21,6 +21,7 @@ app = FastAPI(
 
 app.include_router(admission_router)
 app.include_router(document_router)
+app.include_router(user_router)
 
 
 # ============================================================
