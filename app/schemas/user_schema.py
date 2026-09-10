@@ -23,8 +23,8 @@ class UserResponse(BaseModel):
     name: str
     email: str
     phoneNumber: str
-    course: Optional[str] = None
     conversationId: str
+    course: Optional[str] = None
 
     sentiment: Optional[str] = None
     offerLetterReleased: bool = False

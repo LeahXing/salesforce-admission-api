@@ -2,22 +2,16 @@ from app.core.salesforce import get_salesforce
 
 
 # ==========================================
-# Find User by Email / Phone / Course
+# Find User by Email or Phone
 # ==========================================
 
-def find_user(email: str, phone_number: str, course: str | None = None):
+def find_user(email: str, phone_number: str):
     sf = get_salesforce()
-
-    where_clause = (
-        f"(Email__c = '{email}' OR Phone__c = '{phone_number}')"
-    )
-
-    if course:
-        where_clause += f" AND Course__c = '{course}'"
 
     query = f"""
         SELECT
             Id,
+            Application_No__c,
             First_Name__c,
             Last_Name__c,
             Email__c,
@@ -28,7 +22,8 @@ def find_user(email: str, phone_number: str, course: str | None = None):
             Offer_Letter_Released__c,
             Offer_Letter_Accepted__c
         FROM Customer
-        WHERE {where_clause}
+        WHERE Email__c = '{email}'
+           OR Phone__c = '{phone_number}'
         LIMIT 1
     """
 
@@ -45,6 +40,7 @@ def find_user(email: str, phone_number: str, course: str | None = None):
 # ==========================================
 
 def create_user(
+    application_no: str,
     first_name: str,
     last_name: str,
     email: str,
@@ -55,6 +51,8 @@ def create_user(
     sf = get_salesforce()
 
     customer_data = {
+        "Name": application_no,
+        "Application_No__c": application_no,
         "First_Name__c": first_name,
         "Last_Name__c": last_name,
         "Email__c": email,
@@ -64,7 +62,7 @@ def create_user(
         "Offer_Letter_Released__c": False,
     }
 
-    # Remove fields whose value is None
+    # Remove fields with None values
     customer_data = {
         key: value
         for key, value in customer_data.items()
@@ -77,7 +75,7 @@ def create_user(
 
 
 # ==========================================
-# Get User by Salesforce ID
+# Get User by Salesforce Customer ID
 # ==========================================
 
 def get_user_by_id(user_id: str):
@@ -114,7 +112,7 @@ def update_user_status(
         update_data["Offer_Letter_Accepted__c"] = offer_letter_accepted
 
     if not update_data:
-        return None
+        return get_user_by_id(user_id)
 
     sf.Customer.update(
         user_id,
