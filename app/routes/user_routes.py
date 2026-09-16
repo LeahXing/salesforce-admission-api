@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.core.security import get_current_user
 
 from app.schemas.user_schema import (
     UserLookupCreateRequest,
@@ -16,6 +17,7 @@ from app.services.user_service import (
 router = APIRouter(
     prefix="/users",
     tags=["Users"],
+    dependencies=[Depends(get_current_user)],
 )
 
 

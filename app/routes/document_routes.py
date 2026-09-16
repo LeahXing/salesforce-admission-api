@@ -3,6 +3,7 @@
 # ==========================================
 
 import mimetypes
+from app.core.security import get_current_user
 
 from fastapi import (
     APIRouter,
@@ -11,6 +12,7 @@ from fastapi import (
     Form,
     HTTPException,
     Response,
+    Depends,
 )
 
 from app.schemas.document_schema import (
@@ -39,6 +41,7 @@ from app.services.document_service import (
 router = APIRouter(
     prefix="/admissions",
     tags=["Admission Documents"],
+    dependencies=[Depends(get_current_user)],
 )
 
 

@@ -1,8 +1,12 @@
 import os
 import jwt
 
-from fastapi import HTTPException, status
 from dotenv import load_dotenv
+from fastapi import Depends, HTTPException, status
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 
 
 # ============================================================
@@ -24,6 +28,13 @@ JWT_PUBLIC_KEY = os.getenv("JWT_PUBLIC_KEY")
 
 if JWT_PUBLIC_KEY:
     JWT_PUBLIC_KEY = JWT_PUBLIC_KEY.replace("\\n", "\n")
+
+
+# ============================================================
+# BEARER TOKEN SECURITY
+# ============================================================
+
+bearer_scheme = HTTPBearer()
 
 
 # ============================================================
@@ -53,3 +64,17 @@ def validate_jwt_token(token: str):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid access token",
         )
+
+
+# ============================================================
+# GET CURRENT AUTHENTICATED USER
+# ============================================================
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    token = credentials.credentials
+
+    payload = validate_jwt_token(token)
+
+    return payload
