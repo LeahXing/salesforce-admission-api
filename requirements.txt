@@ -5,3 +5,4 @@ requests==2.34.2
 simple-salesforce==1.12.10
 uvicorn==0.52.1
 python-multipart
+pypdf
