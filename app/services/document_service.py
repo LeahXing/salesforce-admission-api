@@ -3,11 +3,16 @@
 # ==========================================
 
 import json
+import os
+import re
 import shutil
 import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from pypdf import PdfReader
 
 from app.repositories.salesforce_document_repository import (
     get_customer_by_application_no,
@@ -16,11 +21,6 @@ from app.repositories.salesforce_document_repository import (
     get_document_content,
     create_document,
     update_document_verification,
-)
-
-from app.services.pdf_score_extractor import (
-    check_document_readability,
-    extract_academic_percentage_from_pdf,
 )
 
 
@@ -380,6 +380,310 @@ def upload_document_chunk(
 
 
 # ==========================================
+# Helper: PDF Text Extraction
+# ==========================================
+
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract plain text from all pages of a PDF using pypdf."""
+    if not file_path or not os.path.isfile(file_path):
+        return ""
+
+    try:
+        reader = PdfReader(file_path)
+        pages = []
+
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+
+        return "\n".join(pages)
+
+    except Exception as exc:
+        print(
+            f"[PDF_EXTRACTOR] Error reading "
+            f"{file_path}: {exc}"
+        )
+        return ""
+
+
+# ==========================================
+# Helper: PDF Readability Check
+# ==========================================
+
+def check_document_readability(
+    file_path: str,
+) -> Dict[str, Any]:
+    """
+    Determine whether a PDF contains enough
+    extractable text to be considered readable.
+    """
+    if (
+        not file_path
+        or not os.path.isfile(file_path)
+    ):
+        return {
+            "readable": False,
+            "char_count": 0,
+            "reason": (
+                "File not found or inaccessible."
+            ),
+        }
+
+    text = extract_text_from_pdf(
+        file_path
+    )
+
+    char_count = len(
+        text.replace(" ", "")
+        .replace("\n", "")
+        .replace("\t", "")
+    )
+
+    if char_count < 50:
+        return {
+            "readable": False,
+            "char_count": char_count,
+            "reason": (
+                f"Only {char_count} characters "
+                "could be extracted from the "
+                "document. The file appears to "
+                "be a scanned image or blurry PDF "
+                "with no readable text."
+            ),
+        }
+
+    return {
+        "readable": True,
+        "char_count": char_count,
+        "reason": "",
+    }
+
+
+# ==========================================
+# Helper: Academic Percentage Extractor
+# ==========================================
+
+def extract_academic_percentage_from_pdf(
+    file_path: str,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Extract academic percentage from a
+    12th Marksheet PDF.
+    """
+    text = extract_text_from_pdf(
+        file_path
+    )
+
+    if not text:
+        return None, None
+
+    return _parse_percentage_from_text(
+        text
+    )
+
+
+def _parse_percentage_from_text(
+    text: str,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Parse percentage or CGPA from extracted
+    PDF text using the existing rule priority.
+    """
+    if not text:
+        return None, None
+
+    # 1. Aggregate Score: X.X%
+    match = re.search(
+        r"Aggregate\s+Score:\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*%",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        value = float(match.group(1))
+        if 0.0 <= value <= 100.0:
+            return (
+                round(value, 2),
+                f"Aggregate Score ({value}%)",
+            )
+
+    # 2. Grand Total Percentage
+    match = re.search(
+        r"GRAND\s+TOTAL.*?"
+        r"(?:PERCENTAGE:|\()\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*%",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        value = float(match.group(1))
+        if 0.0 <= value <= 100.0:
+            return (
+                round(value, 2),
+                (
+                    "Grand Total Percentage "
+                    f"({value}%)"
+                ),
+            )
+
+    # 3. Explicit Percentage field
+    match = re.search(
+        r"\bPercentage\b\s*[:\n]?\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*%?",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        value = float(match.group(1))
+        if 0.0 <= value <= 100.0:
+            return (
+                round(value, 2),
+                f"Percentage Field ({value}%)",
+            )
+
+    # 4. CGPA / SGPA / GPA field
+    match = re.search(
+        r"\b(?:CGPA|SGPA|GPA|CPI|OGPA|"
+        r"Cumulative\s+Grade\s+Point\s+Average)"
+        r"\s*[:\s]*"
+        r"([0-9]+(?:\.[0-9]+)?)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        cgpa = float(match.group(1))
+
+        if 0.0 < cgpa <= 10.0:
+            percentage = round(
+                (cgpa / 10.0) * 100.0,
+                2,
+            )
+            return (
+                percentage,
+                (
+                    f"CGPA ({cgpa}/10.0 × 100 "
+                    f"= {percentage}%)"
+                ),
+            )
+
+        if 10.0 < cgpa <= 100.0:
+            return (
+                round(cgpa, 2),
+                (
+                    "CGPA as Percentage "
+                    f"({cgpa}%)"
+                ),
+            )
+
+    # 4b. CGPA fraction, e.g. 9.5 / 10.0
+    match = re.search(
+        r"\b([0-9]+(?:\.[0-9]+)?)"
+        r"\s*/\s*10(?:\.0+)?\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        cgpa = float(match.group(1))
+
+        if 0.0 < cgpa <= 10.0:
+            percentage = round(
+                (cgpa / 10.0) * 100.0,
+                2,
+            )
+            return (
+                percentage,
+                (
+                    "CGPA Fraction "
+                    f"({cgpa}/10.0 × 100 "
+                    f"= {percentage}%)"
+                ),
+            )
+
+    # 5. Tabular subject marks average
+    lines = [
+        line.strip()
+        for line in text.split("\n")
+        if line.strip()
+    ]
+
+    if (
+        "subject" in text.lower()
+        and "marks" in text.lower()
+    ):
+        subject_marks = []
+
+        for line in lines:
+            if re.match(
+                r"^\d{2,3}(\.\d+)?$",
+                line,
+            ):
+                value = float(line)
+
+                if 0 <= value <= 100:
+                    subject_marks.append(
+                        value
+                    )
+
+        if len(subject_marks) >= 3:
+            average = round(
+                sum(subject_marks)
+                / len(subject_marks),
+                2,
+            )
+            return (
+                average,
+                (
+                    "Subject Marks Average "
+                    f"({len(subject_marks)} subjects "
+                    f"→ {average}%)"
+                ),
+            )
+
+    # 6. Total / Max Marks ratio
+    match = re.search(
+        r"TOTAL\s*\n.*?\b(\d{3,4})\s*\n"
+        r"\s*(\d{2,4}(?:\.[0-9]+)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        max_marks = float(
+            match.group(1)
+        )
+        obtained_marks = float(
+            match.group(2)
+        )
+
+        if (
+            max_marks > 0
+            and 0 <= obtained_marks <= max_marks
+        ):
+            percentage = round(
+                (obtained_marks / max_marks)
+                * 100,
+                2,
+            )
+            return (
+                percentage,
+                (
+                    "Total/Max Marks "
+                    f"({obtained_marks}/"
+                    f"{max_marks} = "
+                    f"{percentage}%)"
+                ),
+            )
+
+    return None, None
+
+
+# ==========================================
 # Helper: Auto Review 12th Marksheet
 # ==========================================
 
@@ -635,8 +939,24 @@ def complete_document_upload(
         )
 
     # --------------------------------------
-    # Automatically review PDF
+    # Automatically review document
     # --------------------------------------
+
+    document_type = metadata[
+        "document_type"
+    ]
+
+    # Current automatic evaluation rules
+    # support 12th Marksheet only.
+    if (
+        document_type.strip().lower()
+        != "12th marksheet"
+    ):
+        raise ValueError(
+            "Automatic document evaluation "
+            "currently supports "
+            "12th Marksheet only."
+        )
 
     evaluation = evaluate_uploaded_pdf(
         completed_file_path
@@ -683,9 +1003,7 @@ def complete_document_upload(
 
         file_content=file_content,
 
-        document_type=metadata[
-            "document_type"
-        ],
+        document_type=document_type,
 
         source=metadata[
             "source"
