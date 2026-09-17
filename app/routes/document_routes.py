@@ -3,7 +3,7 @@
 # ==========================================
 
 import mimetypes
-from app.core.security import get_current_user
+# from app.core.security import get_current_user
 
 from fastapi import (
     APIRouter,
@@ -41,7 +41,7 @@ from app.services.document_service import (
 router = APIRouter(
     prefix="/admissions",
     tags=["Admission Documents"],
-    dependencies=[Depends(get_current_user)],
+    # dependencies=[Depends(get_current_user)],
 )
 
 
