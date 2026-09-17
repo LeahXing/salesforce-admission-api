@@ -317,8 +317,14 @@ async def complete_upload(
     upload_id: str,
 ):
     """
-    Reassemble all chunks and upload
+    Reassemble all chunks, automatically
+    evaluate the document, and upload the
     completed document to Salesforce.
+
+    Verification result:
+        ELIGIBLE
+        NOT_ELIGIBLE
+        FAILED
     """
 
     try:
@@ -356,19 +362,29 @@ def update_document_verification_status(
     verification: DocumentVerificationUpdate,
 ):
     """
-    Set document verification status to
-    Missing, Verified, or Rejected.
+    Manually update document verification.
+
+    Supported statuses:
+        ELIGIBLE
+        NOT_ELIGIBLE
+        FAILED
+
+    failed_reason is required when
+    verification status is FAILED.
     """
 
     try:
         return verify_document(
             content_version_id=document_id,
+
             verification_status=(
                 verification.verification_status
             ),
-            rejection_reason=(
-                verification.rejection_reason
+
+            failed_reason=(
+                verification.failed_reason
             ),
+
             verified_by=(
                 verification.verified_by
             ),

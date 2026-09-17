@@ -81,13 +81,8 @@ def format_document_response(document):
             "Verification_Status__c"
         ),
 
-        # NEW
-        "eligibility_status": document.get(
-            "Eligibility_Status__c"
-        ),
-
-        "rejection_reason": document.get(
-            "Rejection_Reason__c"
+        "failed_reason": document.get(
+            "Failed_Reason__c"
         ),
 
         "verified_by": document.get(
@@ -384,16 +379,25 @@ def upload_document_chunk(
 # ==========================================
 
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract plain text from all pages of a PDF using pypdf."""
-    if not file_path or not os.path.isfile(file_path):
+    """
+    Extract plain text from all pages
+    of a PDF using pypdf.
+    """
+
+    if (
+        not file_path
+        or not os.path.isfile(file_path)
+    ):
         return ""
 
     try:
         reader = PdfReader(file_path)
+
         pages = []
 
         for page in reader.pages:
             text = page.extract_text()
+
             if text:
                 pages.append(text)
 
@@ -404,6 +408,7 @@ def extract_text_from_pdf(file_path: str) -> str:
             f"[PDF_EXTRACTOR] Error reading "
             f"{file_path}: {exc}"
         )
+
         return ""
 
 
@@ -418,6 +423,7 @@ def check_document_readability(
     Determine whether a PDF contains enough
     extractable text to be considered readable.
     """
+
     if (
         not file_path
         or not os.path.isfile(file_path)
@@ -471,6 +477,7 @@ def extract_academic_percentage_from_pdf(
     Extract academic percentage from a
     12th Marksheet PDF.
     """
+
     text = extract_text_from_pdf(
         file_path
     )
@@ -490,10 +497,14 @@ def _parse_percentage_from_text(
     Parse percentage or CGPA from extracted
     PDF text using the existing rule priority.
     """
+
     if not text:
         return None, None
 
+    # --------------------------------------
     # 1. Aggregate Score: X.X%
+    # --------------------------------------
+
     match = re.search(
         r"Aggregate\s+Score:\s*"
         r"([0-9]+(?:\.[0-9]+)?)\s*%",
@@ -502,14 +513,20 @@ def _parse_percentage_from_text(
     )
 
     if match:
-        value = float(match.group(1))
+        value = float(
+            match.group(1)
+        )
+
         if 0.0 <= value <= 100.0:
             return (
                 round(value, 2),
                 f"Aggregate Score ({value}%)",
             )
 
+    # --------------------------------------
     # 2. Grand Total Percentage
+    # --------------------------------------
+
     match = re.search(
         r"GRAND\s+TOTAL.*?"
         r"(?:PERCENTAGE:|\()\s*"
@@ -519,7 +536,10 @@ def _parse_percentage_from_text(
     )
 
     if match:
-        value = float(match.group(1))
+        value = float(
+            match.group(1)
+        )
+
         if 0.0 <= value <= 100.0:
             return (
                 round(value, 2),
@@ -529,7 +549,10 @@ def _parse_percentage_from_text(
                 ),
             )
 
+    # --------------------------------------
     # 3. Explicit Percentage field
+    # --------------------------------------
+
     match = re.search(
         r"\bPercentage\b\s*[:\n]?\s*"
         r"([0-9]+(?:\.[0-9]+)?)\s*%?",
@@ -538,14 +561,20 @@ def _parse_percentage_from_text(
     )
 
     if match:
-        value = float(match.group(1))
+        value = float(
+            match.group(1)
+        )
+
         if 0.0 <= value <= 100.0:
             return (
                 round(value, 2),
                 f"Percentage Field ({value}%)",
             )
 
+    # --------------------------------------
     # 4. CGPA / SGPA / GPA field
+    # --------------------------------------
+
     match = re.search(
         r"\b(?:CGPA|SGPA|GPA|CPI|OGPA|"
         r"Cumulative\s+Grade\s+Point\s+Average)"
@@ -556,13 +585,16 @@ def _parse_percentage_from_text(
     )
 
     if match:
-        cgpa = float(match.group(1))
+        cgpa = float(
+            match.group(1)
+        )
 
         if 0.0 < cgpa <= 10.0:
             percentage = round(
                 (cgpa / 10.0) * 100.0,
                 2,
             )
+
             return (
                 percentage,
                 (
@@ -580,7 +612,10 @@ def _parse_percentage_from_text(
                 ),
             )
 
+    # --------------------------------------
     # 4b. CGPA fraction, e.g. 9.5 / 10.0
+    # --------------------------------------
+
     match = re.search(
         r"\b([0-9]+(?:\.[0-9]+)?)"
         r"\s*/\s*10(?:\.0+)?\b",
@@ -589,13 +624,16 @@ def _parse_percentage_from_text(
     )
 
     if match:
-        cgpa = float(match.group(1))
+        cgpa = float(
+            match.group(1)
+        )
 
         if 0.0 < cgpa <= 10.0:
             percentage = round(
                 (cgpa / 10.0) * 100.0,
                 2,
             )
+
             return (
                 percentage,
                 (
@@ -605,7 +643,10 @@ def _parse_percentage_from_text(
                 ),
             )
 
+    # --------------------------------------
     # 5. Tabular subject marks average
+    # --------------------------------------
+
     lines = [
         line.strip()
         for line in text.split("\n")
@@ -623,7 +664,9 @@ def _parse_percentage_from_text(
                 r"^\d{2,3}(\.\d+)?$",
                 line,
             ):
-                value = float(line)
+                value = float(
+                    line
+                )
 
                 if 0 <= value <= 100:
                     subject_marks.append(
@@ -636,6 +679,7 @@ def _parse_percentage_from_text(
                 / len(subject_marks),
                 2,
             )
+
             return (
                 average,
                 (
@@ -645,7 +689,10 @@ def _parse_percentage_from_text(
                 ),
             )
 
+    # --------------------------------------
     # 6. Total / Max Marks ratio
+    # --------------------------------------
+
     match = re.search(
         r"TOTAL\s*\n.*?\b(\d{3,4})\s*\n"
         r"\s*(\d{2,4}(?:\.[0-9]+)?)\b",
@@ -657,6 +704,7 @@ def _parse_percentage_from_text(
         max_marks = float(
             match.group(1)
         )
+
         obtained_marks = float(
             match.group(2)
         )
@@ -666,10 +714,14 @@ def _parse_percentage_from_text(
             and 0 <= obtained_marks <= max_marks
         ):
             percentage = round(
-                (obtained_marks / max_marks)
+                (
+                    obtained_marks
+                    / max_marks
+                )
                 * 100,
                 2,
             )
+
             return (
                 percentage,
                 (
@@ -694,15 +746,18 @@ def evaluate_uploaded_pdf(
     Automatically review an uploaded
     12th Marksheet PDF.
 
-    Mapping:
+    Results:
 
-    Passed:
-        Verification_Status__c = Verified
-        Eligibility_Status__c  = ELIGIBLE
+        ELIGIBLE
+            Score extracted successfully
+            and score >= 70%.
 
-    Failed:
-        Verification_Status__c = Rejected
-        Eligibility_Status__c  = NOT_ELIGIBLE
+        NOT_ELIGIBLE
+            Score extracted successfully
+            but score < 70%.
+
+        FAILED
+            Score could not be extracted.
     """
 
     verified_by = "Auto Evaluation Engine"
@@ -717,8 +772,8 @@ def evaluate_uploaded_pdf(
 
     if not readability["readable"]:
 
-        rejection_reason = (
-            "Document is blurry or unreadable. "
+        failed_reason = (
+            "Unable to extract academic score. "
             f"{readability['reason']} "
             "Please upload a clear, "
             "high-quality scan of your "
@@ -726,9 +781,8 @@ def evaluate_uploaded_pdf(
         )
 
         return {
-            "verification_status": "Rejected",
-            "eligibility_status": "NOT_ELIGIBLE",
-            "rejection_reason": rejection_reason,
+            "verification_status": "FAILED",
+            "failed_reason": failed_reason,
             "verified_by": verified_by,
             "score": None,
             "score_method": None,
@@ -746,18 +800,15 @@ def evaluate_uploaded_pdf(
 
     if score is None:
 
-        rejection_reason = (
-            "Could not extract a valid "
-            "percentage from the document. "
-            "Please ensure the marksheet "
-            "clearly shows the percentage "
-            "or CGPA."
+        failed_reason = (
+            "Unable to extract academic score. "
+            "The document does not contain a "
+            "recognizable percentage or CGPA."
         )
 
         return {
-            "verification_status": "Rejected",
-            "eligibility_status": "NOT_ELIGIBLE",
-            "rejection_reason": rejection_reason,
+            "verification_status": "FAILED",
+            "failed_reason": failed_reason,
             "verified_by": verified_by,
             "score": None,
             "score_method": None,
@@ -769,31 +820,22 @@ def evaluate_uploaded_pdf(
 
     if score < SCORE_CUTOFF:
 
-        rejection_reason = (
-            f"12th Marksheet percentage "
-            f"{score}% is below the minimum "
-            f"required {SCORE_CUTOFF}%. "
-            "Students must score at least "
-            f"{SCORE_CUTOFF}% to be eligible."
-        )
-
         return {
-            "verification_status": "Rejected",
-            "eligibility_status": "NOT_ELIGIBLE",
-            "rejection_reason": rejection_reason,
+            "verification_status":
+                "NOT_ELIGIBLE",
+            "failed_reason": None,
             "verified_by": verified_by,
             "score": score,
             "score_method": method,
         }
 
     # --------------------------------------
-    # 4. Score passed
+    # 4. Score meets cutoff
     # --------------------------------------
 
     return {
-        "verification_status": "Verified",
-        "eligibility_status": "ELIGIBLE",
-        "rejection_reason": None,
+        "verification_status": "ELIGIBLE",
+        "failed_reason": None,
         "verified_by": verified_by,
         "score": score,
         "score_method": method,
@@ -815,8 +857,7 @@ def complete_document_upload(
     12th Marksheet PDF.
 
     Upload the PDF and generated
-    verification/eligibility results
-    to Salesforce.
+    verification result to Salesforce.
     """
 
     upload_path = (
@@ -966,12 +1007,8 @@ def complete_document_upload(
         "verification_status"
     ]
 
-    eligibility_status = evaluation[
-        "eligibility_status"
-    ]
-
-    rejection_reason = evaluation[
-        "rejection_reason"
+    failed_reason = evaluation[
+        "failed_reason"
     ]
 
     verified_by = evaluation[
@@ -1013,12 +1050,8 @@ def complete_document_upload(
             verification_status
         ),
 
-        eligibility_status=(
-            eligibility_status
-        ),
-
-        rejection_reason=(
-            rejection_reason
+        failed_reason=(
+            failed_reason
         ),
 
         verified_by=(
@@ -1026,7 +1059,9 @@ def complete_document_upload(
         ),
     )
 
-    content_version_id = result["id"]
+    content_version_id = result[
+        "id"
+    ]
 
     # --------------------------------------
     # Retrieve created Salesforce document
@@ -1062,9 +1097,6 @@ def complete_document_upload(
         "verification_status":
             verification_status,
 
-        "eligibility_status":
-            eligibility_status,
-
         "score": evaluation[
             "score"
         ],
@@ -1084,28 +1116,23 @@ def complete_document_upload(
 def verify_document(
     content_version_id: str,
     verification_status: str,
-    rejection_reason: str | None = None,
+    failed_reason: str | None = None,
     verified_by: str | None = None,
 ):
     """
     Manually update document verification.
 
-    Verification / eligibility mapping:
+    Supported statuses:
 
-        Missing
-            -> PENDING_DOCUMENTS
-
-        Verified
-            -> ELIGIBLE
-
-        Rejected
-            -> NOT_ELIGIBLE
+        ELIGIBLE
+        NOT_ELIGIBLE
+        FAILED
     """
 
     allowed_statuses = {
-        "Missing",
-        "Verified",
-        "Rejected",
+        "ELIGIBLE",
+        "NOT_ELIGIBLE",
+        "FAILED",
     }
 
     if (
@@ -1114,16 +1141,16 @@ def verify_document(
     ):
         raise ValueError(
             "Verification status must be "
-            "Missing, Verified, or Rejected."
+            "ELIGIBLE, NOT_ELIGIBLE, or FAILED."
         )
 
     if (
-        verification_status == "Rejected"
-        and not rejection_reason
+        verification_status == "FAILED"
+        and not failed_reason
     ):
         raise ValueError(
-            "Rejection reason is required "
-            "when a document is rejected."
+            "Failed reason is required when "
+            "verification status is FAILED."
         )
 
     document = get_document_by_id(
@@ -1136,88 +1163,33 @@ def verify_document(
             "was not found."
         )
 
-    # --------------------------------------
-    # Verification -> Eligibility mapping
-    # --------------------------------------
-
-    eligibility_mapping = {
-        "Missing": "PENDING_DOCUMENTS",
-        "Verified": "ELIGIBLE",
-        "Rejected": "NOT_ELIGIBLE",
-    }
-
-    eligibility_status = (
-        eligibility_mapping[
-            verification_status
-        ]
-    )
-
     verification_data = {
         "Verification_Status__c":
             verification_status,
 
-        "Eligibility_Status__c":
-            eligibility_status,
+        "Verified_At__c":
+            datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
     }
 
-    # --------------------------------------
-    # Verified / Rejected
-    # --------------------------------------
+    if verified_by:
+        verification_data[
+            "Verified_By__c"
+        ] = verified_by
 
-    if verification_status in {
-        "Verified",
-        "Rejected",
-    }:
+    if verification_status == "FAILED":
 
         verification_data[
-            "Verified_At__c"
-        ] = datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-
-        if verified_by:
-            verification_data[
-                "Verified_By__c"
-            ] = verified_by
-
-    # --------------------------------------
-    # Rejected
-    # --------------------------------------
-
-    if verification_status == "Rejected":
-
-        verification_data[
-            "Rejection_Reason__c"
-        ] = rejection_reason
-
-    # --------------------------------------
-    # Verified
-    # --------------------------------------
-
-    elif verification_status == "Verified":
-
-        verification_data[
-            "Rejection_Reason__c"
-        ] = None
-
-    # --------------------------------------
-    # Missing
-    # --------------------------------------
+            "Failed_Reason__c"
+        ] = failed_reason
 
     else:
 
         verification_data[
-            "Rejection_Reason__c"
-        ] = None
-
-        verification_data[
-            "Verified_By__c"
-        ] = None
-
-        verification_data[
-            "Verified_At__c"
+            "Failed_Reason__c"
         ] = None
 
     update_document_verification(

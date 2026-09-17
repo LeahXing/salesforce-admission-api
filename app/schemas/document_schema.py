@@ -62,13 +62,13 @@ class DocumentResponse(BaseModel):
     document_type: str
     source: str
 
-    # Document verification result
+    # Automatic verification result:
+    # ELIGIBLE, NOT_ELIGIBLE, or FAILED
     verification_status: Optional[str] = None
 
-    # Document eligibility result
-    eligibility_status: Optional[str] = None
+    # Populated only when verification failed
+    failed_reason: Optional[str] = None
 
-    rejection_reason: Optional[str] = None
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
 
@@ -88,9 +88,8 @@ class UploadCompleteResponse(BaseModel):
     application_no: str
     status: str
 
-    # Automatic evaluation results
+    # Automatic verification result
     verification_status: str
-    eligibility_status: str
 
     # Extracted academic score
     score: Optional[float] = None
@@ -109,16 +108,19 @@ class DocumentVerificationUpdate(BaseModel):
     document verification.
 
     Supported verification statuses:
-        Missing
-        Verified
-        Rejected
+        ELIGIBLE
+        NOT_ELIGIBLE
+        FAILED
 
-    Eligibility is derived automatically:
-        Missing  -> PENDING_DOCUMENTS
-        Verified -> ELIGIBLE
-        Rejected -> NOT_ELIGIBLE
+    Rules:
+        score >= 70% -> ELIGIBLE
+        score < 70%  -> NOT_ELIGIBLE
+        no score     -> FAILED
+
+    failed_reason is required when the
+    verification status is FAILED.
     """
 
     verification_status: str
-    rejection_reason: Optional[str] = None
+    failed_reason: Optional[str] = None
     verified_by: Optional[str] = None
