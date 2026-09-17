@@ -14,7 +14,8 @@ from pydantic import BaseModel
 
 class UploadInitializeResponse(BaseModel):
     """
-    Information returned when an upload session is created.
+    Information returned when an upload
+    session is created.
     """
 
     upload_id: str
@@ -30,7 +31,8 @@ class UploadInitializeResponse(BaseModel):
 
 class ChunkUploadResponse(BaseModel):
     """
-    Information returned after one chunk is uploaded.
+    Information returned after one chunk
+    is uploaded.
     """
 
     upload_id: str
@@ -60,7 +62,12 @@ class DocumentResponse(BaseModel):
     document_type: str
     source: str
 
+    # Document verification result
     verification_status: Optional[str] = None
+
+    # Document eligibility result
+    eligibility_status: Optional[str] = None
+
     rejection_reason: Optional[str] = None
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
@@ -73,12 +80,22 @@ class DocumentResponse(BaseModel):
 class UploadCompleteResponse(BaseModel):
     """
     Information returned after the completed
-    document is uploaded to Salesforce.
+    document is automatically reviewed and
+    uploaded to Salesforce.
     """
 
     upload_id: str
     application_no: str
     status: str
+
+    # Automatic evaluation results
+    verification_status: str
+    eligibility_status: str
+
+    # Extracted academic score
+    score: Optional[float] = None
+    score_method: Optional[str] = None
+
     document: DocumentResponse
 
 
@@ -88,7 +105,18 @@ class UploadCompleteResponse(BaseModel):
 
 class DocumentVerificationUpdate(BaseModel):
     """
-    Request body for document verification.
+    Request body for manually updating
+    document verification.
+
+    Supported verification statuses:
+        Missing
+        Verified
+        Rejected
+
+    Eligibility is derived automatically:
+        Missing  -> PENDING_DOCUMENTS
+        Verified -> ELIGIBLE
+        Rejected -> NOT_ELIGIBLE
     """
 
     verification_status: str

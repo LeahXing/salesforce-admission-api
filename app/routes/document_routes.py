@@ -357,7 +357,7 @@ def update_document_verification_status(
 ):
     """
     Set document verification status to
-    Pending, Verified, or Rejected.
+    Missing, Verified, or Rejected.
     """
 
     try:

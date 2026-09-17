@@ -18,10 +18,17 @@ from app.repositories.salesforce_document_repository import (
     update_document_verification,
 )
 
+from app.services.pdf_score_extractor import (
+    check_document_readability,
+    extract_academic_percentage_from_pdf,
+)
+
 
 # ==========================================
-# Temporary Upload Storage
+# Constants
 # ==========================================
+
+SCORE_CUTOFF = 70.0
 
 UPLOAD_DIR = Path("temp_uploads")
 
@@ -43,17 +50,21 @@ def format_document_response(document):
 
     return {
         "document_id": document["Id"],
+
         "application_id": document.get(
             "Application__c"
         ),
 
         "file_name": document["PathOnClient"],
+
         "file_extension": document.get(
             "FileExtension"
         ),
+
         "file_size": document.get(
             "ContentSize"
         ),
+
         "upload_datetime": document[
             "CreatedDate"
         ],
@@ -61,6 +72,7 @@ def format_document_response(document):
         "document_type": document[
             "Document_Type__c"
         ],
+
         "source": document[
             "Source__c"
         ],
@@ -68,12 +80,20 @@ def format_document_response(document):
         "verification_status": document.get(
             "Verification_Status__c"
         ),
+
+        # NEW
+        "eligibility_status": document.get(
+            "Eligibility_Status__c"
+        ),
+
         "rejection_reason": document.get(
             "Rejection_Reason__c"
         ),
+
         "verified_by": document.get(
             "Verified_By__c"
         ),
+
         "verified_at": document.get(
             "Verified_At__c"
         ),
@@ -360,6 +380,123 @@ def upload_document_chunk(
 
 
 # ==========================================
+# Helper: Auto Review 12th Marksheet
+# ==========================================
+
+def evaluate_uploaded_pdf(
+    file_path: Path,
+):
+    """
+    Automatically review an uploaded
+    12th Marksheet PDF.
+
+    Mapping:
+
+    Passed:
+        Verification_Status__c = Verified
+        Eligibility_Status__c  = ELIGIBLE
+
+    Failed:
+        Verification_Status__c = Rejected
+        Eligibility_Status__c  = NOT_ELIGIBLE
+    """
+
+    verified_by = "Auto Evaluation Engine"
+
+    # --------------------------------------
+    # 1. Check PDF readability
+    # --------------------------------------
+
+    readability = check_document_readability(
+        str(file_path)
+    )
+
+    if not readability["readable"]:
+
+        rejection_reason = (
+            "Document is blurry or unreadable. "
+            f"{readability['reason']} "
+            "Please upload a clear, "
+            "high-quality scan of your "
+            "12th Marksheet."
+        )
+
+        return {
+            "verification_status": "Rejected",
+            "eligibility_status": "NOT_ELIGIBLE",
+            "rejection_reason": rejection_reason,
+            "verified_by": verified_by,
+            "score": None,
+            "score_method": None,
+        }
+
+    # --------------------------------------
+    # 2. Extract academic percentage
+    # --------------------------------------
+
+    score, method = (
+        extract_academic_percentage_from_pdf(
+            str(file_path)
+        )
+    )
+
+    if score is None:
+
+        rejection_reason = (
+            "Could not extract a valid "
+            "percentage from the document. "
+            "Please ensure the marksheet "
+            "clearly shows the percentage "
+            "or CGPA."
+        )
+
+        return {
+            "verification_status": "Rejected",
+            "eligibility_status": "NOT_ELIGIBLE",
+            "rejection_reason": rejection_reason,
+            "verified_by": verified_by,
+            "score": None,
+            "score_method": None,
+        }
+
+    # --------------------------------------
+    # 3. Check score against cutoff
+    # --------------------------------------
+
+    if score < SCORE_CUTOFF:
+
+        rejection_reason = (
+            f"12th Marksheet percentage "
+            f"{score}% is below the minimum "
+            f"required {SCORE_CUTOFF}%. "
+            "Students must score at least "
+            f"{SCORE_CUTOFF}% to be eligible."
+        )
+
+        return {
+            "verification_status": "Rejected",
+            "eligibility_status": "NOT_ELIGIBLE",
+            "rejection_reason": rejection_reason,
+            "verified_by": verified_by,
+            "score": score,
+            "score_method": method,
+        }
+
+    # --------------------------------------
+    # 4. Score passed
+    # --------------------------------------
+
+    return {
+        "verification_status": "Verified",
+        "eligibility_status": "ELIGIBLE",
+        "rejection_reason": None,
+        "verified_by": verified_by,
+        "score": score,
+        "score_method": method,
+    }
+
+
+# ==========================================
 # 6. Complete Document Upload
 # ==========================================
 
@@ -368,8 +505,14 @@ def complete_document_upload(
     upload_id: str,
 ):
     """
-    Reassemble all chunks and upload
-    completed file to Salesforce.
+    Reassemble all chunks.
+
+    Automatically review the completed
+    12th Marksheet PDF.
+
+    Upload the PDF and generated
+    verification/eligibility results
+    to Salesforce.
     """
 
     upload_path = (
@@ -407,7 +550,10 @@ def complete_document_upload(
         "total_chunks"
     ]
 
+    # --------------------------------------
     # Check missing chunks
+    # --------------------------------------
+
     missing_chunks = []
 
     for chunk_number in range(
@@ -429,7 +575,10 @@ def complete_document_upload(
             f"Missing chunks: {missing_chunks}"
         )
 
+    # --------------------------------------
     # Reassemble file
+    # --------------------------------------
+
     completed_file_path = (
         upload_path /
         "completed_file"
@@ -459,7 +608,10 @@ def complete_document_upload(
                     completed_file,
                 )
 
+    # --------------------------------------
     # Verify file size
+    # --------------------------------------
+
     actual_file_size = (
         completed_file_path
         .stat()
@@ -482,31 +634,85 @@ def complete_document_upload(
             f"{actual_file_size} bytes."
         )
 
+    # --------------------------------------
+    # Automatically review PDF
+    # --------------------------------------
+
+    evaluation = evaluate_uploaded_pdf(
+        completed_file_path
+    )
+
+    verification_status = evaluation[
+        "verification_status"
+    ]
+
+    eligibility_status = evaluation[
+        "eligibility_status"
+    ]
+
+    rejection_reason = evaluation[
+        "rejection_reason"
+    ]
+
+    verified_by = evaluation[
+        "verified_by"
+    ]
+
+    # --------------------------------------
     # Read final file
+    # --------------------------------------
+
     with open(
         completed_file_path,
         "rb",
     ) as f:
         file_content = f.read()
 
-    # Upload to Salesforce
+    # --------------------------------------
+    # Upload file + evaluation to Salesforce
+    # --------------------------------------
+
     result = create_document(
         customer_id=metadata[
             "customer_id"
         ],
+
         file_name=metadata[
             "file_name"
         ],
+
         file_content=file_content,
+
         document_type=metadata[
             "document_type"
         ],
+
         source=metadata[
             "source"
         ],
+
+        verification_status=(
+            verification_status
+        ),
+
+        eligibility_status=(
+            eligibility_status
+        ),
+
+        rejection_reason=(
+            rejection_reason
+        ),
+
+        verified_by=(
+            verified_by
+        ),
     )
 
     content_version_id = result["id"]
+
+    # --------------------------------------
+    # Retrieve created Salesforce document
+    # --------------------------------------
 
     document = get_document_by_id(
         content_version_id
@@ -518,15 +724,37 @@ def complete_document_upload(
         )
     )
 
-    # Delete temporary files
+    # --------------------------------------
+    # Delete temporary upload files
+    # --------------------------------------
+
     shutil.rmtree(
         upload_path
     )
+
+    # --------------------------------------
+    # Return API response
+    # --------------------------------------
 
     return {
         "upload_id": upload_id,
         "application_no": application_no,
         "status": "completed",
+
+        "verification_status":
+            verification_status,
+
+        "eligibility_status":
+            eligibility_status,
+
+        "score": evaluation[
+            "score"
+        ],
+
+        "score_method": evaluation[
+            "score_method"
+        ],
+
         "document": document_response,
     }
 
@@ -542,12 +770,22 @@ def verify_document(
     verified_by: str | None = None,
 ):
     """
-    Change document status to:
-    Pending, Verified, or Rejected.
+    Manually update document verification.
+
+    Verification / eligibility mapping:
+
+        Missing
+            -> PENDING_DOCUMENTS
+
+        Verified
+            -> ELIGIBLE
+
+        Rejected
+            -> NOT_ELIGIBLE
     """
 
     allowed_statuses = {
-        "Pending",
+        "Missing",
         "Verified",
         "Rejected",
     }
@@ -558,7 +796,7 @@ def verify_document(
     ):
         raise ValueError(
             "Verification status must be "
-            "Pending, Verified, or Rejected."
+            "Missing, Verified, or Rejected."
         )
 
     if (
@@ -580,15 +818,39 @@ def verify_document(
             "was not found."
         )
 
+    # --------------------------------------
+    # Verification -> Eligibility mapping
+    # --------------------------------------
+
+    eligibility_mapping = {
+        "Missing": "PENDING_DOCUMENTS",
+        "Verified": "ELIGIBLE",
+        "Rejected": "NOT_ELIGIBLE",
+    }
+
+    eligibility_status = (
+        eligibility_mapping[
+            verification_status
+        ]
+    )
+
     verification_data = {
         "Verification_Status__c":
             verification_status,
+
+        "Eligibility_Status__c":
+            eligibility_status,
     }
+
+    # --------------------------------------
+    # Verified / Rejected
+    # --------------------------------------
 
     if verification_status in {
         "Verified",
         "Rejected",
     }:
+
         verification_data[
             "Verified_At__c"
         ] = datetime.now(
@@ -602,17 +864,32 @@ def verify_document(
                 "Verified_By__c"
             ] = verified_by
 
+    # --------------------------------------
+    # Rejected
+    # --------------------------------------
+
     if verification_status == "Rejected":
+
         verification_data[
             "Rejection_Reason__c"
         ] = rejection_reason
 
+    # --------------------------------------
+    # Verified
+    # --------------------------------------
+
     elif verification_status == "Verified":
+
         verification_data[
             "Rejection_Reason__c"
         ] = None
 
+    # --------------------------------------
+    # Missing
+    # --------------------------------------
+
     else:
+
         verification_data[
             "Rejection_Reason__c"
         ] = None
