@@ -745,13 +745,24 @@ def extract_ielts_overall_band_from_pdf(
 ) -> Tuple[Optional[float], Optional[str]]:
     """
     Extract IELTS Overall Band Score
-    from an IELTS Test Report Form.
+    from a real IELTS Test Report Form.
+
+    Supports layouts such as:
+
+        Overall Band Score 6.5
+
+    and:
+
+        Overall
+        Band
+        Score
+        3.5
 
     Returns:
         (score, method)
 
     Example:
-        (8.0, "IELTS Overall Band (8.0)")
+        (3.5, "IELTS Overall Band (3.5)")
     """
 
     text = extract_text_from_pdf(
@@ -762,27 +773,25 @@ def extract_ielts_overall_band_from_pdf(
         return None, None
 
     # --------------------------------------
-    # 1. IELTS results table
+    # 1. Real IELTS TRF format
     #
-    # Listening Reading Writing Speaking
-    # Overall Band CEFR Level
-    # 8.5 8.0 7.5 8.5 8.0 C1
+    # Overall
+    # Band
+    # Score
+    # 3.5
+    #
+    # or:
+    #
+    # Overall Band Score 6.5
     # --------------------------------------
 
     match = re.search(
         (
-            r"Listening\s+"
-            r"Reading\s+"
-            r"Writing\s+"
-            r"Speaking\s+"
-            r"Overall\s+Band"
-            r"(?:\s+CEFR\s+Level)?"
-            r"\s+"
-            r"([0-9](?:\.[05])?)\s+"
-            r"([0-9](?:\.[05])?)\s+"
-            r"([0-9](?:\.[05])?)\s+"
-            r"([0-9](?:\.[05])?)\s+"
-            r"([0-9](?:\.[05])?)"
+            r"\bOverall\s+"
+            r"Band\s+"
+            r"Score\s*"
+            r"[:\-]?\s*"
+            r"([0-9](?:\.[05])?)\b"
         ),
         text,
         re.IGNORECASE,
@@ -790,7 +799,7 @@ def extract_ielts_overall_band_from_pdf(
 
     if match:
         overall_band = float(
-            match.group(5)
+            match.group(1)
         )
 
         if 0.0 <= overall_band <= 9.0:
@@ -803,18 +812,17 @@ def extract_ielts_overall_band_from_pdf(
             )
 
     # --------------------------------------
-    # 2. Explicit Overall Band field
+    # 2. Alternative IELTS format
     #
-    # Overall Band: 6.5
-    # Overall Band Score: 6.5
+    # Overall Band 6.5
     # --------------------------------------
 
     match = re.search(
         (
-            r"Overall\s+Band"
-            r"(?:\s+Score)?"
-            r"\s*[:\-]?\s*"
-            r"([0-9](?:\.[05])?)"
+            r"\bOverall\s+"
+            r"Band\s*"
+            r"[:\-]?\s*"
+            r"([0-9](?:\.[05])?)\b"
         ),
         text,
         re.IGNORECASE,
