@@ -29,6 +29,7 @@ from app.repositories.salesforce_document_repository import (
 # ==========================================
 
 SCORE_CUTOFF = 70.0
+IELTS_CUTOFF = 6.0
 
 UPLOAD_DIR = Path("temp_uploads")
 
@@ -736,6 +737,107 @@ def _parse_percentage_from_text(
 
 
 # ==========================================
+# Helper: IELTS Overall Band Extractor
+# ==========================================
+
+def extract_ielts_overall_band_from_pdf(
+    file_path: str,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Extract IELTS Overall Band Score
+    from an IELTS Test Report Form.
+
+    Returns:
+        (score, method)
+
+    Example:
+        (8.0, "IELTS Overall Band (8.0)")
+    """
+
+    text = extract_text_from_pdf(
+        file_path
+    )
+
+    if not text:
+        return None, None
+
+    # --------------------------------------
+    # 1. IELTS results table
+    #
+    # Listening Reading Writing Speaking
+    # Overall Band CEFR Level
+    # 8.5 8.0 7.5 8.5 8.0 C1
+    # --------------------------------------
+
+    match = re.search(
+        (
+            r"Listening\s+"
+            r"Reading\s+"
+            r"Writing\s+"
+            r"Speaking\s+"
+            r"Overall\s+Band"
+            r"(?:\s+CEFR\s+Level)?"
+            r"\s+"
+            r"([0-9](?:\.[05])?)\s+"
+            r"([0-9](?:\.[05])?)\s+"
+            r"([0-9](?:\.[05])?)\s+"
+            r"([0-9](?:\.[05])?)\s+"
+            r"([0-9](?:\.[05])?)"
+        ),
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        overall_band = float(
+            match.group(5)
+        )
+
+        if 0.0 <= overall_band <= 9.0:
+            return (
+                round(overall_band, 1),
+                (
+                    "IELTS Overall Band "
+                    f"({overall_band})"
+                ),
+            )
+
+    # --------------------------------------
+    # 2. Explicit Overall Band field
+    #
+    # Overall Band: 6.5
+    # Overall Band Score: 6.5
+    # --------------------------------------
+
+    match = re.search(
+        (
+            r"Overall\s+Band"
+            r"(?:\s+Score)?"
+            r"\s*[:\-]?\s*"
+            r"([0-9](?:\.[05])?)"
+        ),
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        overall_band = float(
+            match.group(1)
+        )
+
+        if 0.0 <= overall_band <= 9.0:
+            return (
+                round(overall_band, 1),
+                (
+                    "IELTS Overall Band "
+                    f"({overall_band})"
+                ),
+            )
+
+    return None, None
+
+
+# ==========================================
 # Helper: Auto Review 12th Marksheet
 # ==========================================
 
@@ -843,6 +945,111 @@ def evaluate_uploaded_pdf(
 
 
 # ==========================================
+# Helper: Auto Review IELTS
+# ==========================================
+
+def evaluate_ielts_pdf(
+    file_path: Path,
+):
+    """
+    Automatically review an uploaded
+    IELTS Test Report Form.
+
+    Results:
+
+        ELIGIBLE
+            Overall Band extracted successfully
+            and score >= 6.0.
+
+        NOT_ELIGIBLE
+            Overall Band extracted successfully
+            but score < 6.0.
+
+        FAILED
+            Overall Band could not be extracted.
+    """
+
+    verified_by = "Auto Evaluation Engine"
+
+    # --------------------------------------
+    # 1. Check PDF readability
+    # --------------------------------------
+
+    readability = check_document_readability(
+        str(file_path)
+    )
+
+    if not readability["readable"]:
+
+        failed_reason = (
+            "Unable to extract IELTS score. "
+            f"{readability['reason']} "
+            "Please upload a clear, readable "
+            "IELTS Test Report Form."
+        )
+
+        return {
+            "verification_status": "FAILED",
+            "failed_reason": failed_reason,
+            "verified_by": verified_by,
+            "score": None,
+            "score_method": None,
+        }
+
+    # --------------------------------------
+    # 2. Extract IELTS Overall Band
+    # --------------------------------------
+
+    score, method = (
+        extract_ielts_overall_band_from_pdf(
+            str(file_path)
+        )
+    )
+
+    if score is None:
+
+        failed_reason = (
+            "Unable to extract IELTS Overall "
+            "Band score from the document."
+        )
+
+        return {
+            "verification_status": "FAILED",
+            "failed_reason": failed_reason,
+            "verified_by": verified_by,
+            "score": None,
+            "score_method": None,
+        }
+
+    # --------------------------------------
+    # 3. Check IELTS score against cutoff
+    # --------------------------------------
+
+    if score < IELTS_CUTOFF:
+
+        return {
+            "verification_status":
+                "NOT_ELIGIBLE",
+            "failed_reason": None,
+            "verified_by": verified_by,
+            "score": score,
+            "score_method": method,
+        }
+
+    # --------------------------------------
+    # 4. IELTS score meets cutoff
+    # --------------------------------------
+
+    return {
+        "verification_status": "ELIGIBLE",
+        "failed_reason": None,
+        "verified_by": verified_by,
+        "score": score,
+        "score_method": method,
+    }
+
+
+# ==========================================
 # 6. Complete Document Upload
 # ==========================================
 
@@ -853,8 +1060,10 @@ def complete_document_upload(
     """
     Reassemble all chunks.
 
-    Automatically review the completed
-    12th Marksheet PDF.
+    Automatically review supported documents:
+
+        12th Marksheet
+        IELTS
 
     Upload the PDF and generated
     verification result to Salesforce.
@@ -987,21 +1196,49 @@ def complete_document_upload(
         "document_type"
     ]
 
-    # Current automatic evaluation rules
-    # support 12th Marksheet only.
-    if (
-        document_type.strip().lower()
-        != "12th marksheet"
+    normalized_document_type = (
+        document_type
+        .strip()
+        .lower()
+    )
+
+    # --------------------------------------
+    # 12th Marksheet
+    # --------------------------------------
+
+    if normalized_document_type == (
+        "12th marksheet"
     ):
+
+        evaluation = evaluate_uploaded_pdf(
+            completed_file_path
+        )
+
+    # --------------------------------------
+    # IELTS
+    # --------------------------------------
+
+    elif normalized_document_type in {
+        "ielts",
+        "ielts score",
+        "ielts score report",
+        "ielts test report form",
+    }:
+
+        evaluation = evaluate_ielts_pdf(
+            completed_file_path
+        )
+
+    # --------------------------------------
+    # Unsupported document type
+    # --------------------------------------
+
+    else:
         raise ValueError(
             "Automatic document evaluation "
             "currently supports "
-            "12th Marksheet only."
+            "12th Marksheet and IELTS only."
         )
-
-    evaluation = evaluate_uploaded_pdf(
-        completed_file_path
-    )
 
     verification_status = evaluation[
         "verification_status"
