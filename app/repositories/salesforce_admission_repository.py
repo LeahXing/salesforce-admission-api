@@ -8,33 +8,58 @@ from app.core.salesforce import get_salesforce
 def get_all_admissions():
     sf = get_salesforce()
 
-    result = sf.query("""
+    result = sf.query_all("""
         SELECT
             Id,
             Application_No__c,
+            User_ID__c,
+            Conversation_ID__c,
             Student_ID__c,
+
             First_Name__c,
             Last_Name__c,
             Email__c,
             Phone__c,
             City__c,
             Gender__c,
+
+            Education_Level__c,
             Course__c,
             Major__c,
             Advising_College__c,
             Intake__c,
             Semester__c,
             Residency__c,
+
+            Academic_Percentage__c,
+            Original_CGPA__c,
+            Converted_Percentage__c,
+            IELTS_Overall_Score__c,
+            Course_Eligibility__c,
+
+            Lead_Score__c,
+            Lead_Category__c,
+
             Admission_Status__c,
             Approved_By__c,
-            Offer_Status__c,
-            Offer_Sent_At__c,
+
+            Token_Status__c,
+            Token__c,
+
             Sentiment__c,
+
+            Offer_Status__c,
+            Offer_Letter_Released__c,
+            Offer_Letter_Accepted__c,
+            Offer_Sent_At__c,
+
             University_ID__c,
             Remarks__c,
+
             Created_At__c,
             Updated_At__c,
             Testing_Record__c
+
         FROM Customer
         ORDER BY CreatedDate DESC
     """)

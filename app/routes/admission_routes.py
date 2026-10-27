@@ -2,7 +2,8 @@
 # Admission Routes
 # ==========================================
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+# from app.core.security import get_current_user
 
 from app.schemas.admission_schema import (
     AdmissionCreate,
@@ -21,6 +22,7 @@ from app.services.admission_service import (
 router = APIRouter(
     prefix="/admissions",
     tags=["Admissions"],
+    # dependencies=[Depends(get_current_user)],
 )
 
 
@@ -63,7 +65,9 @@ def get_admission_application(application_id: str):
 @router.post("")
 def create_admission_application(admission: AdmissionCreate):
     try:
-        admission_data = admission.model_dump()
+        admission_data = admission.model_dump(
+            exclude_unset=True
+        )
 
         return register_admission(admission_data)
 

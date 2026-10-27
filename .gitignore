@@ -1,5 +1,19 @@
+# Environment variables and credentials
 .env
 .env.*
 !.env.example
 
+# Python virtual environments
 .venv/
+venv/
+
+# Temporary uploads
+temp_uploads/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
