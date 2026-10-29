@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from pypdf import PdfReader
 
+from app.core.admission_document_config import VERIFY_APPLICANT_NAME
+
 from app.repositories.salesforce_document_repository import (
     get_customer_by_application_no,
     get_documents_by_application,
@@ -709,7 +711,7 @@ def _customer_name(customer: Dict[str, Any]) -> str:
     first = customer.get("First_Name__c") or customer.get("FirstName") or ""
     last = customer.get("Last_Name__c") or customer.get("LastName") or ""
     name = f"{first} {last}".strip() or str(customer.get("Name") or "").strip()
-    if not name:
+    if not name and VERIFY_APPLICANT_NAME:
         raise ValueError("Applicant name is missing from Salesforce Customer.")
     return name
 
@@ -729,21 +731,30 @@ def _extract_ielts(pdf_bytes: bytes) -> Dict[str, Any]:
     return {"document_type": "IELTS", "detected_document_type": "IELTS" if re.search(r"\bIELTS\b|\bOverall\s+Band\b", text, re.I) else None,
             "overall_band": score, "student_name": None,
             "extraction_status": "REVIEW_REQUIRED" if score is None else "EXTRACTED",
-            "warnings": ["Applicant name not reliably extracted from IELTS report"],
+            "warnings": ([] if not VERIFY_APPLICANT_NAME else ["Applicant name not reliably extracted from IELTS report"]),
             "issuer_authenticity_verified": False}
 
 
 def _extract_document(pdf_bytes: bytes, dtype: str, applicant_name: str) -> Dict[str, Any]:
+    """Extract document evidence; avoid name-dependent checks in test mode."""
     if dtype == "ID_PROOF":
-        from app.services.identity_document_extractor import verify_passport_name
-        return verify_passport_name(pdf_bytes, applicant_name)
+        from app.services.identity_document_extractor import extract_identity_document
+
+        return extract_identity_document(
+            pdf_bytes,
+            applicant_name if VERIFY_APPLICANT_NAME else None,
+        )
     if dtype in {"CLASS_12_MARKSHEET", "UNDERGRADUATE_TRANSCRIPT"}:
         from app.services.academic_score_extractor import extract_academic_record
         return extract_academic_record(pdf_bytes, dtype)
     if dtype == "IELTS":
         return _extract_ielts(pdf_bytes)
     from app.services.exam_score_extractor import extract_exam_score
-    return extract_exam_score(pdf_bytes, dtype, applicant_name)
+    # Avoid passing the Salesforce name when comparison is disabled.
+    # The exam extractor may still need updating if it requires a name.
+    return extract_exam_score(
+        pdf_bytes, dtype, applicant_name if VERIFY_APPLICANT_NAME else ""
+    )
 
 
 def upload_and_verify_document(
@@ -774,7 +785,7 @@ def upload_and_verify_document(
     if customer is None:
         raise ValueError(f"Application {application_no} was not found.")
     program = _customer_program(customer)
-    applicant_name = _customer_name(customer)
+    applicant_name = _customer_name(customer) if VERIFY_APPLICANT_NAME else ""
     try:
         extracted = _extract_document(file_content, dtype, applicant_name)
     except Exception as exc:
@@ -782,7 +793,8 @@ def upload_and_verify_document(
         extracted = {"extraction_status": "REVIEW_REQUIRED", "warnings": [f"Extraction error: {type(exc).__name__}"],
                      "document_type": dtype}
     validation = validate_document(document_type=dtype, applicant_name=applicant_name,
-                                   extracted_data=extracted, program=program)
+                                   extracted_data=extracted, program=program,
+                                   verify_applicant_name=VERIFY_APPLICANT_NAME)
     if extracted.get("extraction_status") == "REVIEW_REQUIRED" and validation["verification_status"] == "PASSED":
         validation["verification_status"] = "REVIEW_REQUIRED"
         validation["reason_codes"] = list(dict.fromkeys(validation["reason_codes"] + ["EXTRACTION_UNCERTAIN"]))
@@ -798,6 +810,7 @@ def upload_and_verify_document(
     document_id = created["id"]
     stored = get_document_by_id(document_id)
     return {"application_no": application_no, "document_type": dtype,
+            "name_match_status": validation["name_match_status"],
             "verification_status": verification_status,
             "requirement_status": validation["requirement_status"],
             "extracted_data": extracted, "validation": validation,

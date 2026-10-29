@@ -1,7 +1,7 @@
 """Document-level validation for Admissions API (no Salesforce side effects).
 
 Inputs: extracted dict from academic_score_extractor, exam_score_extractor,
-identity_document_extractor. Callers retrieve applicant name from Salesforce.
+identity_document_extractor. Callers may retrieve applicant name from Salesforce when name checks are enabled.
 Outputs distinguish evidence verification from program eligibility.
 
 IMPORTANT: OCR cannot establish document authenticity. Uncertain evidence is
@@ -15,12 +15,12 @@ from typing import Any, Mapping, Optional
 
 try:
     from app.core.admission_document_config import (
-        DOCUMENT_TYPES, DOCUMENT_CATEGORIES, SCORE_THRESHOLDS,
+        DOCUMENT_TYPES, DOCUMENT_CATEGORIES, SCORE_THRESHOLDS, VERIFY_APPLICANT_NAME,
         normalize_document_type, normalize_program, check_document_allowed,
     )
 except ImportError:
     from core.admission_document_config import (
-        DOCUMENT_TYPES, DOCUMENT_CATEGORIES, SCORE_THRESHOLDS,
+        DOCUMENT_TYPES, DOCUMENT_CATEGORIES, SCORE_THRESHOLDS, VERIFY_APPLICANT_NAME,
         normalize_document_type, normalize_program, check_document_allowed,
     )
 
@@ -82,13 +82,18 @@ def validate_document(
     program: str,
     document_readable: Optional[bool] = None,
     name_verified_by_trusted_source: bool = False,
+    verify_applicant_name: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Validate one extracted document; returns a normalized application input.
 
-    `document_readable=False` forces review. `name_verified_by_trusted_source`
+    `document_readable=False` forces review. `verify_applicant_name=None` uses
+    the configured VERIFY_APPLICANT_NAME setting. `name_verified_by_trusted_source`
     is reserved for an independently trusted comparison; never set from OCR.
     No external calls, uploads, score-date policies or issuer checks here.
     """
+    if verify_applicant_name is None:
+        verify_applicant_name = VERIFY_APPLICANT_NAME
+
     dtype = normalize_document_type(document_type)
     prog = normalize_program(program)
     evidence = dict(extracted_data)
@@ -109,8 +114,7 @@ def validate_document(
             type_match = False
     elif 'detected_document_type_match' in evidence:
         type_match = bool(evidence['detected_document_type_match'])
-    if dtype == 'ID_PROOF' and type_match is None and evidence.get('verification_status') == 'PASSED':
-        type_match = True  # Passport extractor has verified a passport MRZ/visual layout.
+    # Do not infer ID document type from a name-verification success.
     if type_match is False:
         flag('DOCUMENT_TYPE_MISMATCH')
     elif type_match is None:
@@ -125,18 +129,21 @@ def validate_document(
     if evidence.get('extraction_status') == 'REVIEW_REQUIRED' and not evidence.get('warnings'):
         flag('EXTRACTION_UNCERTAIN')
 
-    extracted_name = (evidence.get('student_name') or evidence.get('applicant_name')
-                      or evidence.get('extracted_name') or evidence.get('full_name'))
-    name_match = compare_applicant_name(extracted_name, applicant_name)
-    # The passport extractor may already have confirmed a name match using
-    # multiple OCR/MRZ observations without returning the extracted name.
-    if dtype == 'ID_PROOF' and evidence.get('verification_status') == 'PASSED' and evidence.get('name_match') is True:
-        name_match = 'MATCH'
-    if name_match != 'MATCH':
-        if name_verified_by_trusted_source and extracted_name and _tokens(extracted_name):
-            flag('NAME_MISMATCH')
-        else:
-            flag('NAME_MATCH_UNCERTAIN')
+    # Name checks can be disabled for test documents belonging to different people.
+    # Never treat an extractor's name_match flag as proof of document type.
+    if verify_applicant_name:
+        extracted_name = (evidence.get('student_name') or evidence.get('applicant_name')
+                          or evidence.get('extracted_name') or evidence.get('full_name'))
+        name_match = compare_applicant_name(extracted_name, applicant_name)
+        if dtype == 'ID_PROOF' and evidence.get('verification_status') == 'PASSED' and evidence.get('name_match') is True:
+            name_match = 'MATCH'
+        if name_match != 'MATCH':
+            if name_verified_by_trusted_source and extracted_name and _tokens(extracted_name):
+                flag('NAME_MISMATCH')
+            else:
+                flag('NAME_MATCH_UNCERTAIN')
+    else:
+        name_match = 'SKIPPED'
 
     requirement_status = 'NOT_EVALUATED'
     measured_score: Optional[float] = None
@@ -204,7 +211,7 @@ def validate_document(
         else:
             requirement_status = 'REVIEW_REQUIRED'
     else:
-        # ID_PROOF: only name verification; no passport expiry, DOB or number.
+        # ID_PROOF: document-type evidence only; no passport expiry, DOB or number.
         requirement_status = 'SATISFIED'
         if evidence.get('verification_status') == 'REVIEW_REQUIRED':
             flag('IDENTITY_EXTRACTION_UNCERTAIN')

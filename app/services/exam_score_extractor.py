@@ -15,6 +15,8 @@ from typing import Any
 
 import fitz
 
+from app.core.admission_document_config import VERIFY_APPLICANT_NAME
+
 MONTH = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
 DATE = rf'(?:\d{{1,2}}\s+{MONTH}\s+\d{{4}}|{MONTH}\.?\s+\d{{1,2}},?\s+\d{{4}}|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}})'
 
@@ -207,12 +209,15 @@ def extract_exam_score(pdf_bytes: bytes, document_type: str, applicant_name: str
     methods = []
     ocr_conf = []
     # Score tables and name are on first page; SAT summary on second page.
-    for p in list(doc)[:2 if expected == 'SAT' else 1]:
-        txt, method, confidence = _page_text(p)
-        pages.append(txt)
-        methods.append(method)
-        if confidence is not None:
-            ocr_conf.append(confidence)
+    try:
+        for i in range(min(len(doc), 2 if expected == 'SAT' else 1)):
+            txt, method, confidence = _page_text(doc[i])
+            pages.append(txt)
+            methods.append(method)
+            if confidence is not None:
+                ocr_conf.append(confidence)
+    finally:
+        doc.close()
     text = '\n'.join(pages)
     first = pages[0] if pages else ''
     # Match report headings rather than incidental references to the test in policy pages.
@@ -223,33 +228,32 @@ def extract_exam_score(pdf_bytes: bytes, document_type: str, applicant_name: str
         'TOEFL': r'TOEFL\s+iBT\s+Scaled\s+Scores|TOEFL\s+iBT\s+Test\s+Taker\s+Score\s+Report'
     }
     matched = bool(find(markers[expected], text))
-    name = get_name(first, expected)
-    if not name and expected == 'SAT' and len(pages) > 1:
+    name = get_name(first, expected) if VERIFY_APPLICANT_NAME else None
+    if VERIFY_APPLICANT_NAME and not name and expected == 'SAT' and len(pages) > 1:
         m = find(r'\n\s*([A-Z][a-z]+\s+[A-Z][a-z]+)\s*\n\s*Test\s+Date', pages[1])
         if m:
             name = clean(m.group(1))
     result = PARSERS[expected](text)
     total = result['total_score']
     score_ok = bool(result['score_consistent'])
-    name_status = compare_name(name, applicant_name) if applicant_name is not None else 'NOT_CHECKED'
-    # Missing name, score, type, or low OCR confidence -> manual review rather than invented success.
+    name_status = (compare_name(name, applicant_name) if applicant_name else 'REVIEW_REQUIRED') if VERIFY_APPLICANT_NAME else 'SKIPPED'
+    # Missing score/type or low OCR confidence requires review. Names only matter when enabled.
     reasons = []
     if not matched:
         reasons.append('DOCUMENT_TYPE_UNCERTAIN')
     if not score_ok:
         reasons.append('SCORE_EXTRACTION_UNCERTAIN')
-    if not name:
-        reasons.append('NAME_EXTRACTION_UNCERTAIN')
-    if name_status == 'REVIEW_REQUIRED':
-        reasons.append('NAME_MATCH_UNCERTAIN')
-    if name_status == 'MISMATCH':
-        reasons.append('NAME_MISMATCH')
+    if VERIFY_APPLICANT_NAME:
+        if not name:
+            reasons.append('NAME_EXTRACTION_UNCERTAIN')
+        if name_status == 'REVIEW_REQUIRED':
+            reasons.append('NAME_MATCH_UNCERTAIN')
+        if name_status == 'MISMATCH':
+            reasons.append('NAME_MISMATCH')
     if ocr_conf and min(ocr_conf) < 65:
         reasons.append('LOW_OCR_CONFIDENCE')
     if not reasons:
         verification = 'PASSED'
-    elif reasons == ['NAME_MISMATCH']:
-        verification = 'FAILED'
     else:
         verification = 'REVIEW_REQUIRED'
     if not matched or not score_ok:
@@ -260,11 +264,12 @@ def extract_exam_score(pdf_bytes: bytes, document_type: str, applicant_name: str
         eligibility = 'BELOW_SCORE_THRESHOLD'
     if verification == 'PASSED':
         message = f'{expected} score report processed successfully. Your score of {total} ' + ('meets' if eligibility == 'MEETS_SCORE_THRESHOLD' else 'does not meet') + f' the required score of greater than {THRESHOLDS[expected]}.'
-    elif 'NAME_MISMATCH' in reasons and len(reasons) == 1:
-        message = 'The name on your score report does not match your application. Please check your details or request manual verification.'
+    elif 'NAME_MISMATCH' in reasons:
+        message = 'The name on your score report needs manual verification against your application.'
     else:
         message = 'We could not confidently verify all information in your score report. Our admissions team needs to review this document manually.'
     return {'document_type': expected, 'detected_document_type_match': matched,
+            'extraction_status': 'EXTRACTED' if verification == 'PASSED' else 'REVIEW_REQUIRED',
             'student_name': name, 'name_match_status': name_status,
             'test_date': result.get('test_date'), 'total_score': total,
             'sections': result['sections'], 'score_scale': result.get('score_scale'),

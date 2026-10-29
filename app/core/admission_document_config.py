@@ -5,6 +5,15 @@ No Salesforce or OCR dependencies. Program rules can later be loaded from CRM.
 from __future__ import annotations
 from typing import Any
 
+# ==========================================
+# Document Verification Settings
+# ==========================================
+
+# Temporary testing mode:
+# False = Skip applicant name matching
+# True  = Verify applicant name against the document
+VERIFY_APPLICANT_NAME = False
+
 DOCUMENT_TYPES = (
     'ID_PROOF', 'CLASS_12_MARKSHEET', 'UNDERGRADUATE_TRANSCRIPT',
     'SAT', 'GRE', 'GMAT', 'IELTS', 'TOEFL',
