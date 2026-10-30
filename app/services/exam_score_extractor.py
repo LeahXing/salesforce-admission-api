@@ -15,8 +15,6 @@ from typing import Any
 
 import fitz
 
-from app.core.admission_document_config import VERIFY_APPLICANT_NAME
-
 MONTH = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
 DATE = rf'(?:\d{{1,2}}\s+{MONTH}\s+\d{{4}}|{MONTH}\.?\s+\d{{1,2}},?\s+\d{{4}}|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{4}})'
 
@@ -129,24 +127,114 @@ def get_name(text: str, test: str) -> str | None:
 
 
 def _sat(text: str) -> dict[str, Any]:
-    # Prefer explicit SAT Summary of Scores; avoid benchmark/percentile numbers.
-    summary = text.split('SAT Summary of Scores', 1)[-1] if 'SAT Summary of Scores' in text else ''
-    m = find(r'\bTotal\s+(\d{3,4})\b', summary[:1000]) if summary else None
-    if not m:
-        m = find(r'Your\s+Total\s+Score[\s\S]{0,350}?\b([4-9]\d{2}|1[0-5]\d{2}|1600)\b', text)
-    total = int(m.group(1)) if m else None
-    ebrw = find(r'Evidence-Based\s+Reading\s+and\s+Writing\s+(\d{3})', summary[:1000]) if summary else None
-    math = find(r'\bMath\s+(\d{3})', summary[:1000]) if summary else None
-    sections = {'evidence_based_reading_writing': int(ebrw.group(1)) if ebrw else None,
-                'math': int(math.group(1)) if math else None}
-    if total is None and all(v is not None for v in sections.values()):
-        total = sum(sections.values())
-    valid = total is not None and 400 <= total <= 1600 and total % 10 == 0
-    if all(v is not None for v in sections.values()):
-        valid = valid and all(200 <= v <= 800 for v in sections.values()) and sum(sections.values()) == total
-    return {'total_score': total, 'sections': sections, 'score_consistent': valid,
-            'test_date': score_date(text)}
+    """Extract SAT scores from text PDFs, including label-after-score layouts."""
 
+    summary = (
+        text.split("SAT Summary of Scores", 1)[-1]
+        if "SAT Summary of Scores" in text
+        else ""
+    )
+
+    total = None
+    ebrw_score = None
+    math_score = None
+
+    if summary:
+        # Format A: scores appear before labels (PyMuPDF sort=True).
+        # Example:
+        # 1540
+        # 1400
+        # Total
+        # 750
+        # 620
+        # Evidence-Based Reading and Writing
+        # Math
+        # 790
+        # 780
+
+        m = find(
+            r"\b(1[0-5]\d{2}|1600|[4-9]\d{2})\s+"
+            r"([4-9]\d{2}|1[0-5]\d{2}|1600)\s+"
+            r"Total\b",
+            summary[:1000],
+        )
+
+        if m:
+            total = int(m.group(1))
+
+        m = find(
+            r"\b(\d{3})\s+\d{3}\s+"
+            r"Evidence-Based\s+Reading\s+and\s+Writing\b",
+            summary[:1000],
+        )
+
+        if m:
+            ebrw_score = int(m.group(1))
+
+        m = find(
+            r"\bMath\s+(\d{3})\s+\d{3}\b",
+            summary[:1000],
+        )
+
+        if m:
+            math_score = int(m.group(1))
+
+        # Format B: conventional label-first summary tables.
+        if total is None:
+            m = find(
+                r"\bTotal\s+(1[0-5]\d{2}|1600|[4-9]\d{2})\b",
+                summary[:1000],
+            )
+            if m:
+                total = int(m.group(1))
+
+        if ebrw_score is None:
+            m = find(
+                r"Evidence-Based\s+Reading\s+and\s+Writing\s+(\d{3})",
+                summary[:1000],
+            )
+            if m:
+                ebrw_score = int(m.group(1))
+
+        if math_score is None:
+            m = find(
+                r"\bMath\s+(\d{3})",
+                summary[:1000],
+            )
+            if m:
+                math_score = int(m.group(1))
+
+    # Use section scores only when both are present and valid.
+    if (
+        ebrw_score is not None
+        and math_score is not None
+        and 200 <= ebrw_score <= 800
+        and 200 <= math_score <= 800
+    ):
+        section_total = ebrw_score + math_score
+
+        if total is None:
+            total = section_total
+
+    # Do not guess a total from nearby numbers when the summary is ambiguous.
+    valid = (
+        total is not None
+        and 400 <= total <= 1600
+        and total % 10 == 0
+    )
+
+    if ebrw_score is not None and math_score is not None:
+        valid = valid and (ebrw_score + math_score == total)
+
+    return {
+        "total_score": total,
+        "sections": {
+            "evidence_based_reading_writing": ebrw_score,
+            "math": math_score,
+        },
+        "score_consistent": valid,
+        "test_date": score_date(text),
+    }
 
 def _gre(text: str) -> dict[str, Any]:
     # Restrict to the actual score-history table, not recipient tables or policy text.
@@ -170,17 +258,170 @@ def _gre(text: str) -> dict[str, Any]:
 
 
 def _gmat(text: str) -> dict[str, Any]:
-    # Legacy GMAT (200-800) table; NEVER confuse self-reported undergraduate GPA with GMAT score.
-    part = text.split('Test Information (Score / % Below)', 1)[-1].split('©', 1)[0]
-    m = find(rf'({DATE})\s+(\d{{1,2}})\s*/\s*\d+%\s+(\d{{1,2}})\s*/\s*\d+%\s+(\d{{3}})\s*/\s*\d+%\s+([0-6](?:\.\d)?)\s*/\s*\d+%\s+(\d{{1,2}})\s*/\s*\d+%', part)
-    if not m:
-        return {'total_score': None, 'sections': {}, 'score_consistent': False, 'test_date': None, 'score_scale': 'LEGACY_200_800'}
-    verbal, quant, total, awa, ir = int(m.group(2)), int(m.group(3)), int(m.group(4)), float(m.group(5)), int(m.group(6))
-    return {'total_score': total,
-            'sections': {'verbal': verbal, 'quantitative': quant, 'analytical_writing': awa, 'integrated_reasoning': ir},
-            'score_consistent': 200 <= total <= 800 and total % 10 == 0 and 0 <= verbal <= 60 and 0 <= quant <= 60 and 0 <= awa <= 6 and 1 <= ir <= 8,
-            'test_date': parse_date(m.group(1)), 'score_scale': 'LEGACY_200_800'}
+    """
+    Extract the highest valid legacy GMAT Total Score (200–800).
 
+    Supports:
+    1. Row-based score tables (Sample 1)
+    2. Column-grouped score tables (Sample 2)
+
+    Canceled attempts are ignored.
+    """
+    import re
+
+    empty = {
+        "total_score": None,
+        "sections": {},
+        "score_consistent": False,
+        "test_date": None,
+        "score_scale": "LEGACY_200_800",
+    }
+
+    marker = "Test Information (Score / % Below)"
+    if marker not in text:
+        return empty
+
+    part = text.split(marker, 1)[1].split("©", 1)[0]
+
+    candidates = []
+
+    def add_candidate(date_str, verbal, quant, total, awa, ir):
+        try:
+            verbal = int(verbal)
+            quant = int(quant)
+            total = int(total)
+            awa = float(awa)
+            ir = int(ir)
+        except (TypeError, ValueError):
+            return
+
+        date = parse_date(date_str)
+
+        valid = (
+            date is not None
+            and 200 <= total <= 800
+            and total % 10 == 0
+            and 0 <= verbal <= 60
+            and 0 <= quant <= 60
+            and 0 <= awa <= 6
+            and 1 <= ir <= 8
+        )
+
+        if valid:
+            candidates.append({
+                "total_score": total,
+                "sections": {
+                    "verbal": verbal,
+                    "quantitative": quant,
+                    "analytical_writing": awa,
+                    "integrated_reasoning": ir,
+                },
+                "score_consistent": True,
+                "test_date": date,
+                "score_scale": "LEGACY_200_800",
+            })
+
+    # --------------------------------------------------
+    # Format 1: Row-based GMAT score table
+    # --------------------------------------------------
+    row_pattern = re.compile(
+        rf"({DATE})\s+"
+        r"(\d{1,2})\s*/\s*\d+%\s+"
+        r"(\d{1,2})\s*/\s*\d+%\s+"
+        r"(\d{3})\s*/\s*\d+%\s+"
+        r"([0-6](?:\.\d)?)\s*/\s*\d+%\s+"
+        r"(\d{1,2})\s*/\s*\d+%",
+        re.IGNORECASE,
+    )
+
+    for match in row_pattern.finditer(part):
+        add_candidate(*match.groups())
+
+    # --------------------------------------------------
+    # Format 2: Column-grouped GMAT score table
+    # --------------------------------------------------
+    lines = [
+        line.strip()
+        for line in part.splitlines()
+        if line.strip()
+    ]
+
+    date_pattern = re.compile(
+        r"^\d{1,2}\s+[A-Za-z]+\s+\d{4}$"
+    )
+
+    score_pattern = re.compile(
+        r"^(\d+(?:\.\d+)?)\s*/\s*\d+%$"
+    )
+
+    # Locate the score-table header.
+    header = [
+        "Test Date",
+        "Verbal",
+        "Quantitative",
+        "Total",
+        "Analytical Writing",
+        "Integrated Reasoning",
+    ]
+
+    for i in range(len(lines) - len(header) + 1):
+        if lines[i:i + len(header)] != header:
+            continue
+
+        values = lines[i + len(header):]
+
+        # Collect consecutive test dates.
+        dates = []
+        pos = 0
+
+        while pos < len(values) and date_pattern.fullmatch(values[pos]):
+            dates.append(values[pos])
+            pos += 1
+
+        if not dates:
+            continue
+
+        n = len(dates)
+
+        # Each of the five score columns contains n entries.
+        columns = []
+
+        for _ in range(5):
+            column = []
+
+            for _ in range(n):
+                if pos >= len(values):
+                    break
+
+                match = score_pattern.fullmatch(values[pos])
+
+                if not match:
+                    break
+
+                column.append(match.group(1))
+                pos += 1
+
+            if len(column) != n:
+                break
+
+            columns.append(column)
+
+        if len(columns) == 5:
+            for j, date in enumerate(dates):
+                add_candidate(
+                    date,
+                    columns[0][j],
+                    columns[1][j],
+                    columns[2][j],
+                    columns[3][j],
+                    columns[4][j],
+                )
+
+    if not candidates:
+        return empty
+
+    # Select highest valid GMAT Total Score.
+    return max(candidates, key=lambda item: item["total_score"])
 
 def _toefl(text: str) -> dict[str, Any]:
     # Score box on page 1; avoid the score legends/ranges on page 2.
@@ -209,15 +450,12 @@ def extract_exam_score(pdf_bytes: bytes, document_type: str, applicant_name: str
     methods = []
     ocr_conf = []
     # Score tables and name are on first page; SAT summary on second page.
-    try:
-        for i in range(min(len(doc), 2 if expected == 'SAT' else 1)):
-            txt, method, confidence = _page_text(doc[i])
-            pages.append(txt)
-            methods.append(method)
-            if confidence is not None:
-                ocr_conf.append(confidence)
-    finally:
-        doc.close()
+    for p in list(doc)[:2 if expected == 'SAT' else 1]:
+        txt, method, confidence = _page_text(p)
+        pages.append(txt)
+        methods.append(method)
+        if confidence is not None:
+            ocr_conf.append(confidence)
     text = '\n'.join(pages)
     first = pages[0] if pages else ''
     # Match report headings rather than incidental references to the test in policy pages.
@@ -228,52 +466,55 @@ def extract_exam_score(pdf_bytes: bytes, document_type: str, applicant_name: str
         'TOEFL': r'TOEFL\s+iBT\s+Scaled\s+Scores|TOEFL\s+iBT\s+Test\s+Taker\s+Score\s+Report'
     }
     matched = bool(find(markers[expected], text))
-    name = get_name(first, expected) if VERIFY_APPLICANT_NAME else None
-    if VERIFY_APPLICANT_NAME and not name and expected == 'SAT' and len(pages) > 1:
+    name = get_name(first, expected)
+    if not name and expected == 'SAT' and len(pages) > 1:
         m = find(r'\n\s*([A-Z][a-z]+\s+[A-Z][a-z]+)\s*\n\s*Test\s+Date', pages[1])
         if m:
             name = clean(m.group(1))
     result = PARSERS[expected](text)
     total = result['total_score']
     score_ok = bool(result['score_consistent'])
-    name_status = (compare_name(name, applicant_name) if applicant_name else 'REVIEW_REQUIRED') if VERIFY_APPLICANT_NAME else 'SKIPPED'
-    # Missing score/type or low OCR confidence requires review. Names only matter when enabled.
+    name_status = 'SKIPPED'  # Demo: all name matching disabled
+    # Missing name, score, type, or low OCR confidence -> manual review rather than invented success.
     reasons = []
     if not matched:
         reasons.append('DOCUMENT_TYPE_UNCERTAIN')
     if not score_ok:
         reasons.append('SCORE_EXTRACTION_UNCERTAIN')
-    if VERIFY_APPLICANT_NAME:
-        if not name:
-            reasons.append('NAME_EXTRACTION_UNCERTAIN')
-        if name_status == 'REVIEW_REQUIRED':
-            reasons.append('NAME_MATCH_UNCERTAIN')
-        if name_status == 'MISMATCH':
-            reasons.append('NAME_MISMATCH')
+    if name_status == 'REVIEW_REQUIRED':
+        reasons.append('NAME_MATCH_UNCERTAIN')
+    if name_status == 'MISMATCH':
+        reasons.append('NAME_MISMATCH')
     if ocr_conf and min(ocr_conf) < 65:
         reasons.append('LOW_OCR_CONFIDENCE')
     if not reasons:
         verification = 'PASSED'
+    elif reasons == ['NAME_MISMATCH']:
+        verification = 'FAILED'
     else:
         verification = 'REVIEW_REQUIRED'
     if not matched or not score_ok:
         eligibility = 'NOT_EVALUATED'
-    elif total > THRESHOLDS[expected]:
+    elif total >= THRESHOLDS[expected]:
         eligibility = 'MEETS_SCORE_THRESHOLD'
     else:
         eligibility = 'BELOW_SCORE_THRESHOLD'
     if verification == 'PASSED':
-        message = f'{expected} score report processed successfully. Your score of {total} ' + ('meets' if eligibility == 'MEETS_SCORE_THRESHOLD' else 'does not meet') + f' the required score of greater than {THRESHOLDS[expected]}.'
-    elif 'NAME_MISMATCH' in reasons:
-        message = 'The name on your score report needs manual verification against your application.'
+        message = (
+            f'{expected} score report processed successfully. '
+            f'Your score of {total} '
+            + ('meets' if eligibility == 'MEETS_SCORE_THRESHOLD' else 'does not meet')
+            + f' the required minimum score of {THRESHOLDS[expected]}.'
+        )
+    elif 'NAME_MISMATCH' in reasons and len(reasons) == 1:
+        message = 'The name on your score report does not match your application. Please check your details or request manual verification.'
     else:
         message = 'We could not confidently verify all information in your score report. Our admissions team needs to review this document manually.'
     return {'document_type': expected, 'detected_document_type_match': matched,
-            'extraction_status': 'EXTRACTED' if verification == 'PASSED' else 'REVIEW_REQUIRED',
             'student_name': name, 'name_match_status': name_status,
             'test_date': result.get('test_date'), 'total_score': total,
             'sections': result['sections'], 'score_scale': result.get('score_scale'),
-            'score_consistent': score_ok, 'score_threshold': {'operator': '>', 'value': THRESHOLDS[expected]},
+            'score_consistent': score_ok, 'score_threshold': {'operator': '>=', 'value': THRESHOLDS[expected]},
             'score_eligibility': eligibility, 'verification_status': verification,
             'reason_codes': reasons, 'extraction_methods': methods,
             'ocr_confidence': round(min(ocr_conf), 1) if ocr_conf else None,

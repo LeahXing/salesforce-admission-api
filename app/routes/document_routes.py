@@ -1,7 +1,7 @@
-"""FastAPI routes for Salesforce admissions document management.
+"""FastAPI routes for Salesforce admission document management.
 
-Preserves document retrieval and manual verification while providing single-file
-verification and caller-supplied application eligibility evaluation.
+Upload responses are intentionally concise. Document extraction, validation,
+Salesforce file storage, history and eligibility updates remain in the service.
 """
 from __future__ import annotations
 
@@ -13,10 +13,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.schemas.document_schema import (
-    DocumentResponse,
-    DocumentVerificationUpdate,
-)
+from app.schemas.document_schema import DocumentResponse, DocumentVerificationUpdate
 from app.services.document_service import (
     list_documents,
     get_document,
@@ -24,17 +21,17 @@ from app.services.document_service import (
     verify_document,
     upload_and_verify_document,
     evaluate_application_documents,
+    evaluate_and_save_application_documents,
 )
 
 router = APIRouter(prefix="/admissions", tags=["Admission Documents"])
+MAX_PDF_BYTES = 10 * 1024 * 1024
 
-# This is intentionally not read from Salesforce: the current repository does
-# not persist the structured validation evidence required to re-evaluate it.
+
 class EligibilityEvaluationRequest(BaseModel):
-    document_results: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Current validation results for this application, not raw ContentVersion rows.",
-    )
+    """Current trusted document validation evidence, not ContentVersion rows."""
+
+    document_results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def _error(exc: Exception, *, not_found: bool = False) -> HTTPException:
@@ -43,8 +40,84 @@ def _error(exc: Exception, *, not_found: bool = False) -> HTTPException:
         if not_found or "was not found" in message or "not found" in message:
             return HTTPException(status_code=404, detail=message)
         return HTTPException(status_code=400, detail=message)
-    # Avoid exposing Salesforce credentials, request payloads, or stack traces.
     return HTTPException(status_code=500, detail="Document service operation failed.")
+
+
+def _first_present(*values: Any) -> Any:
+    """Return the first non-None value (zero is a valid score)."""
+    return next((value for value in values if value is not None), None)
+
+
+def _score_fields(dtype: str | None, extracted: dict, validation: dict) -> dict:
+    if dtype == "CLASS_12_MARKSHEET":
+        return {
+            "extracted_percentage": extracted.get("percentage"),
+            "minimum_required_percentage": 70.0,
+        }
+    if dtype == "UNDERGRADUATE_TRANSCRIPT":
+        return {
+            "extracted_gpa": _first_present(extracted.get("overall_gpa"), extracted.get("extracted_gpa")),
+            "minimum_required_gpa": 3.2,
+        }
+    if dtype == "IELTS":
+        return {
+            "extracted_score": _first_present(extracted.get("overall_band"), extracted.get("score"), validation.get("extracted_score")),
+            "minimum_required_score": 6.5,
+        }
+    thresholds = {"SAT": 1100, "GRE": 290, "GMAT": 600, "TOEFL": 72}
+    if dtype in thresholds:
+        return {
+            "extracted_score": _first_present(validation.get("extracted_score"), extracted.get("score"), extracted.get("total_score")),
+            "minimum_required_score": thresholds[dtype],
+        }
+    return {}
+
+
+def _missing_documents(evaluation: dict) -> list[str]:
+    missing = []
+    for requirement in evaluation.get("requirements") or []:
+        if requirement.get("status") != "MISSING":
+            continue
+        allowed = requirement.get("accepted_document_types") or []
+        if allowed:
+            missing.append("_OR_".join(allowed))
+    return missing
+
+
+def _compact_upload_response(result: dict[str, Any]) -> dict[str, Any]:
+    extracted = result.get("extracted_data") or {}
+    validation = result.get("validation") or {}
+    evaluation = result.get("application_evaluation") or {}
+    document = result.get("document") or {}
+    salesforce_update = result.get("salesforce_update") or {}
+    dtype = result.get("document_type")
+
+    # Only use explicit active state; validation PASSED does not prove active.
+    is_active = result.get("is_active")
+    response = {
+        "application_no": result.get("application_no"),
+        "document_id": document.get("document_id"),
+        "document_type": dtype,
+        "detected_document_type": _first_present(
+            validation.get("detected_document_type"),
+            extracted.get("detected_document_type"),
+            extracted.get("academic_level"),
+        ),
+        **_score_fields(dtype, extracted, validation),
+        "validation_status": _first_present(
+            result.get("validation_status"),
+            validation.get("validation_status"),
+            validation.get("verification_status"),
+        ),
+        "is_active": is_active,
+        "reason_codes": validation.get("reason_codes") or [],
+        "message": result.get("message") or validation.get("message"),
+        "action_required": result.get("action_required") or validation.get("action_required"),
+        "course_eligibility": result.get("course_eligibility") or evaluation.get("course_eligibility"),
+        "missing_documents": _missing_documents(evaluation),
+        "salesforce_updated": salesforce_update.get("document_results_saved") is True,
+    }
+    return response
 
 
 @router.get("/{application_no}/documents", response_model=list[DocumentResponse])
@@ -71,7 +144,6 @@ def view_document(document_id: str):
         document = download_document(document_id)
         file_name = Path(document["file_name"]).name
         media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
-        # RFC 5987 encoding avoids unsafe quotes/newlines in response headers.
         disposition = f"inline; filename*=UTF-8''{quote(file_name, safe='')}"
         return Response(
             content=document["file_content"],
@@ -82,22 +154,11 @@ def view_document(document_id: str):
         raise _error(exc) from exc
 
 
-
-
-
-
-
-
 @router.patch("/documents/{document_id}/verification", response_model=DocumentResponse)
 def update_document_verification_status(
     document_id: str,
     verification: DocumentVerificationUpdate,
 ):
-    """Manually update verification status.
-
-    The DocumentVerificationUpdate schema must permit PASSED, FAILED and
-    REVIEW_REQUIRED; legacy Salesforce statuses may also be supported.
-    """
     try:
         return verify_document(
             content_version_id=document_id,
@@ -116,27 +177,27 @@ async def upload_document_and_verify(
     file: UploadFile = File(...),
     source: str = Form("API"),
 ):
-    """Upload one PDF and return extraction, verification and eligibility feedback.
+    """Upload and validate one PDF; return concise feedback.
 
-    This endpoint does not approve admission or generate an offer letter.
+    Does not approve admission or issue an offer letter.
     """
     file_name = Path(file.filename or "").name
     if not file_name.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload a PDF file with a .pdf extension.")
     try:
-        # Read at most one byte beyond the limit to reject oversized uploads.
-        content = await file.read(10 * 1024 * 1024 + 1)
-        if len(content) > 10 * 1024 * 1024:
+        content = await file.read(MAX_PDF_BYTES + 1)
+        if len(content) > MAX_PDF_BYTES:
             raise HTTPException(status_code=413, detail="PDF exceeds the 10 MB upload limit.")
         if not content:
             raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
-        return upload_and_verify_document(
+        result = upload_and_verify_document(
             application_no=application_no,
             file_name=file_name,
             file_content=content,
             document_type=document_type,
             source=source,
         )
+        return _compact_upload_response(result)
     except HTTPException:
         raise
     except Exception as exc:
@@ -150,13 +211,23 @@ def evaluate_document_eligibility(
     application_no: str,
     payload: EligibilityEvaluationRequest,
 ):
-    """Evaluate supplied current validation evidence; does not read historic scores.
-
-    The caller must supply results belonging to this application. A persisted,
-    authenticated eligibility endpoint requires a structured Salesforce store.
-    """
     try:
         return evaluate_application_documents(
+            application_no=application_no,
+            document_results=payload.document_results,
+        )
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
+@router.post("/{application_no}/documents/evaluate-and-save")
+def evaluate_and_save_document_eligibility(
+    application_no: str,
+    payload: EligibilityEvaluationRequest,
+):
+    """Controlled demo endpoint; service decides whether writes are permitted."""
+    try:
+        return evaluate_and_save_application_documents(
             application_no=application_no,
             document_results=payload.document_results,
         )

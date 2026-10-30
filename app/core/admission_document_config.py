@@ -5,14 +5,7 @@ No Salesforce or OCR dependencies. Program rules can later be loaded from CRM.
 from __future__ import annotations
 from typing import Any
 
-# ==========================================
-# Document Verification Settings
-# ==========================================
-
-# Temporary testing mode:
-# False = Skip applicant name matching
-# True  = Verify applicant name against the document
-VERIFY_APPLICANT_NAME = False
+VERIFY_APPLICANT_NAME = False  # Demo: never compare applicant names
 
 DOCUMENT_TYPES = (
     'ID_PROOF', 'CLASS_12_MARKSHEET', 'UNDERGRADUATE_TRANSCRIPT',
@@ -53,8 +46,8 @@ PROGRAM_RULES = {
     },
 }
 SCORE_THRESHOLDS = {
-    'SAT': ('>', 1100), 'GRE': ('>', 290), 'GMAT': ('>', 600),
-    'IELTS': ('>=', 6.5), 'TOEFL': ('>', 72),
+    'SAT': ('>=', 1100), 'GRE': ('>=', 290), 'GMAT': ('>=', 600),
+    'IELTS': ('>=', 6.5), 'TOEFL': ('>=', 72),
 }
 
 def normalize_document_type(value: str) -> str:

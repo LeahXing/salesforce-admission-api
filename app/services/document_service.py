@@ -13,6 +13,11 @@ from pypdf import PdfReader
 
 from app.core.admission_document_config import VERIFY_APPLICANT_NAME
 
+from app.repositories.salesforce_admission_repository import (
+    update_customer_document_validation,
+    read_document_validation_state,
+)
+
 from app.repositories.salesforce_document_repository import (
     get_customer_by_application_no,
     get_documents_by_application,
@@ -757,6 +762,100 @@ def _extract_document(pdf_bytes: bytes, dtype: str, applicant_name: str) -> Dict
     )
 
 
+
+def _record_upload_and_recalculate(*, application_no: str, customer_id: str,
+                                   program: str, document_id: str, dtype: str,
+                                   file_name: str, validation: dict, extracted: dict):
+    """Append one attempt, select active evidence, and recalculate eligibility."""
+    _, _, _, evaluate_eligibility = _admission_modules()
+    state = read_document_validation_state(customer_id, program)
+    history = state["document_history"]
+    if any(row.get("document_id") == document_id for row in history):
+        raise ValueError("This ContentVersion is already in document history")
+
+    verification = str(validation.get("verification_status") or "REVIEW_REQUIRED").upper()
+    requirement = str(validation.get("requirement_status") or "NOT_EVALUATED").upper()
+    codes = list(validation.get("reason_codes") or [])
+    detected = validation.get("detected_document_type") or extracted.get("detected_document_type")
+    mismatch = any(code in codes for code in ("DOCUMENT_TYPE_MISMATCH", "ACADEMIC_LEVEL_MISMATCH", "DOCUMENT_NOT_ACCEPTED_FOR_PROGRAM"))
+    if mismatch:
+        status = "FAILED"
+    elif verification == "REVIEW_REQUIRED":
+        status = "REVIEW_REQUIRED"
+    elif verification == "FAILED" or requirement == "BELOW_THRESHOLD":
+        status = "FAILED"
+    elif verification == "PASSED" and requirement == "SATISFIED":
+        status = "PASSED"
+    else:
+        status = "REVIEW_REQUIRED"
+
+    previous = next((r for r in reversed(history)
+                     if r.get("document_type") == dtype and r.get("is_active") is True), None)
+    previous_passed = bool(previous and previous.get("validation_status") == "PASSED")
+    # Preserve an existing passing document if a later attempt fails.
+    # A valid below-threshold document may be active when no passing one exists.
+    promote = (not mismatch and verification == "PASSED" and
+               (status == "PASSED" or (requirement == "BELOW_THRESHOLD" and not previous_passed)))
+
+    entry = {
+        "document_id": document_id,
+        "document_type": dtype,
+        "detected_document_type": detected,
+        "validation_status": status,
+        "reason_codes": codes,
+        "reason": validation.get("message") or "",
+        "is_active": False,
+    }
+    # Retain useful scores without duplicating entire OCR results.
+    score_map = {
+        "CLASS_12_MARKSHEET": ("percentage", "minimum_required_percentage", 70.0),
+        "UNDERGRADUATE_TRANSCRIPT": ("extracted_gpa", "minimum_required_gpa", 3.2),
+        "SAT": ("extracted_score", "minimum_required_score", 1100),
+        "GRE": ("extracted_score", "minimum_required_score", 290),
+        "GMAT": ("extracted_score", "minimum_required_score", 600),
+        "IELTS": ("extracted_score", "minimum_required_score", 6.5),
+        "TOEFL": ("extracted_score", "minimum_required_score", 72),
+    }
+    if dtype in score_map and not mismatch:
+        key, threshold_key, threshold = score_map[dtype]
+        value = validation.get(key)
+        if value is None and validation.get("extracted_score") is not None:
+            value = validation["extracted_score"]
+        if value is None:
+            for source_key in ("extracted_score", "score", "percentage", "overall_gpa", "gpa", "overall_band", "total_score"):
+                if source_key in extracted and extracted[source_key] is not None:
+                    value = extracted[source_key]
+                    break
+        if value is not None:
+            entry[key] = value
+        entry[threshold_key] = threshold
+    # Keep the exact requirement classification for eligibility, but not in Customer JSON.
+    # The public JSON has only one status field.
+    if promote:
+        if previous:
+            previous["is_active"] = False
+        entry["is_active"] = True
+    history.append(entry)
+
+    active_results = []
+    for row in history:
+        if row.get("is_active") is not True:
+            continue
+        active_results.append({
+            "document_type": row["document_type"],
+            "validation_status": row["validation_status"],
+        })
+    evaluation = evaluate_eligibility(
+        application_no=application_no, program=program, document_results=active_results
+    )
+    saved = update_customer_document_validation(
+        customer_id=customer_id, program=program,
+        document_results=active_results,
+        course_eligibility=evaluation["course_eligibility"], state=state,
+    )
+    return evaluation, saved, entry["is_active"]
+
+
 def upload_and_verify_document(
     application_no: str,
     file_name: str,
@@ -785,7 +884,7 @@ def upload_and_verify_document(
     if customer is None:
         raise ValueError(f"Application {application_no} was not found.")
     program = _customer_program(customer)
-    applicant_name = _customer_name(customer) if VERIFY_APPLICANT_NAME else ""
+    applicant_name = ""  # Demo: name matching disabled for every document type
     try:
         extracted = _extract_document(file_content, dtype, applicant_name)
     except Exception as exc:
@@ -794,7 +893,7 @@ def upload_and_verify_document(
                      "document_type": dtype}
     validation = validate_document(document_type=dtype, applicant_name=applicant_name,
                                    extracted_data=extracted, program=program,
-                                   verify_applicant_name=VERIFY_APPLICANT_NAME)
+                                   verify_applicant_name=False)
     if extracted.get("extraction_status") == "REVIEW_REQUIRED" and validation["verification_status"] == "PASSED":
         validation["verification_status"] = "REVIEW_REQUIRED"
         validation["reason_codes"] = list(dict.fromkeys(validation["reason_codes"] + ["EXTRACTION_UNCERTAIN"]))
@@ -809,9 +908,21 @@ def upload_and_verify_document(
                               verified_by="Auto Evaluation Engine")
     document_id = created["id"]
     stored = get_document_by_id(document_id)
+    # Persist audit history and automatically evaluate only active evidence.
+    # A Salesforce update failure is reported; it is NOT silently ignored.
+    evaluation, saved, is_active = _record_upload_and_recalculate(
+        application_no=application_no, customer_id=customer["Id"],
+        program=program, document_id=document_id, dtype=dtype,
+        file_name=Path(file_name).name, validation=validation,
+        extracted=extracted,
+    )
     return {"application_no": application_no, "document_type": dtype,
+            "is_active": is_active,
+            "course_eligibility": evaluation["course_eligibility"],
+            "application_evaluation": evaluation,
+            "salesforce_update": saved,
             "name_match_status": validation["name_match_status"],
-            "verification_status": verification_status,
+            "validation_status": ("FAILED" if "DOCUMENT_TYPE_MISMATCH" in validation.get("reason_codes", []) else ("REVIEW_REQUIRED" if verification_status == "REVIEW_REQUIRED" else ("FAILED" if verification_status == "FAILED" or validation.get("requirement_status") == "BELOW_THRESHOLD" else "PASSED"))),
             "requirement_status": validation["requirement_status"],
             "extracted_data": extracted, "validation": validation,
             "message": validation["message"], "action_required": validation["action_required"],
@@ -835,6 +946,92 @@ def evaluate_application_documents(application_no: str, document_results: list[D
     return evaluate_eligibility(application_no=application_no, program=_customer_program(customer),
                                 document_results=normalized)
 
+
+
+# ==========================================
+# 6b. Evaluate and Save Application Eligibility
+# ==========================================
+
+def evaluate_and_save_application_documents(
+    application_no: str,
+    document_results: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Evaluate trusted current evidence and save two Salesforce Customer fields.
+
+    Only use this for controlled demo data. The supplied validation results
+    are not independently verified against Salesforce document content.
+    Uploading a single document does not automatically trigger this write.
+    """
+    if not isinstance(application_no, str) or not application_no.strip():
+        raise ValueError("application_no is required")
+    application_no = application_no.strip()
+
+    if not isinstance(document_results, list):
+        raise ValueError("document_results must be a list")
+
+    customer = get_customer_by_application_no(application_no)
+    if customer is None:
+        raise ValueError(f"Application {application_no} was not found.")
+    customer_id = customer.get("Id")
+    if not customer_id:
+        raise ValueError("Salesforce Customer ID is missing.")
+
+    program = _customer_program(customer)
+    normalize_type, _, _, evaluate_eligibility = _admission_modules()
+    normalized_results: list[Dict[str, Any]] = []
+
+    for index, item in enumerate(document_results):
+        if not isinstance(item, dict):
+            raise ValueError(f"document_results[{index}] must be an object")
+        nested = item.get("validation")
+        if nested is not None and not isinstance(nested, dict):
+            raise ValueError(f"document_results[{index}].validation must be an object")
+        result = dict(nested if nested is not None else item)
+
+        for supplied in (item.get("application_no"), result.get("application_no")):
+            if supplied is not None and str(supplied) != application_no:
+                raise ValueError(
+                    f"document_results[{index}] belongs to a different application"
+                )
+
+        outer_type = item.get("document_type")
+        inner_type = result.get("document_type")
+        if outer_type and inner_type:
+            if normalize_type(str(outer_type)) != normalize_type(str(inner_type)):
+                raise ValueError(
+                    f"document_results[{index}] has conflicting document types"
+                )
+        dtype = inner_type or outer_type
+        if not dtype:
+            raise ValueError(f"document_results[{index}] lacks document_type")
+        result["document_type"] = normalize_type(str(dtype))
+        result["application_no"] = application_no
+        normalized_results.append(result)
+
+    evaluation = evaluate_eligibility(
+        application_no=application_no,
+        program=program,
+        document_results=normalized_results,
+    )
+    course_eligibility = evaluation["course_eligibility"]
+
+    saved = update_customer_document_validation(
+        customer_id=customer_id,
+        program=program,
+        document_results=normalized_results,
+        course_eligibility=course_eligibility,
+    )
+
+    return {
+        "application_no": application_no,
+        "customer_id": customer_id,
+        "program": program,
+        "validation_status": evaluation["validation_status"],
+        "course_eligibility": course_eligibility,
+        "evaluation": evaluation,
+        "document_results": normalized_results,
+        "salesforce_update": saved,
+    }
 
 # ==========================================
 # 7. Update Document Verification

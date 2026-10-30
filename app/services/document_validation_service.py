@@ -91,8 +91,7 @@ def validate_document(
     is reserved for an independently trusted comparison; never set from OCR.
     No external calls, uploads, score-date policies or issuer checks here.
     """
-    if verify_applicant_name is None:
-        verify_applicant_name = VERIFY_APPLICANT_NAME
+    verify_applicant_name = False  # Demo: disabled for ALL document types
 
     dtype = normalize_document_type(document_type)
     prog = normalize_program(program)
@@ -105,7 +104,23 @@ def validate_document(
     if not check_document_allowed(prog, dtype):
         flag('DOCUMENT_NOT_ACCEPTED_FOR_PROGRAM')
 
-    detected = evidence.get('detected_document_type') or evidence.get('document_type')
+    # Determine the actual document type from extracted PDF evidence.
+    detected = evidence.get("detected_document_type")
+
+    if dtype in ACADEMIC:
+        academic_level = _academic_level(evidence)
+
+        academic_type_map = {
+            "CLASS_10": "CLASS_10_MARKSHEET",
+            "CLASS_12": "CLASS_12_MARKSHEET",
+            "UNDERGRADUATE": "UNDERGRADUATE_TRANSCRIPT",
+        }
+
+        detected = academic_type_map.get(academic_level)
+
+    elif not detected:
+        detected = evidence.get("document_type")
+
     type_match: Optional[bool] = None
     if detected:
         try:
@@ -168,23 +183,21 @@ def validate_document(
             else:
                 gpa_eligible = gpa >= 3.2
         if dtype == 'CLASS_12_MARKSHEET':
-            # Bachelor: GPA only until institution approves percentage equivalence.
+            # Bachelor demo: Class 12 percentage >= 70%, not converted GPA.
+            if pct is None:
+                requirement_status = 'REVIEW_REQUIRED'
+                flag('ACADEMIC_SCORE_UNCERTAIN')
+            else:
+                requirement_status = 'SATISFIED' if pct >= 70 else 'BELOW_THRESHOLD'
+        else:
+            # Master and MBA demo: undergraduate cumulative GPA >= 3.2 / 4.0.
             if gpa_eligible is True:
                 requirement_status = 'SATISFIED'
             elif gpa_eligible is False:
                 requirement_status = 'BELOW_THRESHOLD'
             else:
                 requirement_status = 'REVIEW_REQUIRED'
-                flag('GPA_CONVERSION_REQUIRED' if pct is not None else 'ACADEMIC_SCORE_UNCERTAIN')
-        else:
-            # Master/MBA: percentage >=70 OR GPA >=3.2/4.0.
-            if (pct is not None and pct >= 70) or gpa_eligible is True:
-                requirement_status = 'SATISFIED'
-            elif pct is not None and gpa_eligible is False:
-                requirement_status = 'BELOW_THRESHOLD'
-            else:
-                requirement_status = 'REVIEW_REQUIRED'
-                flag('ACADEMIC_ALTERNATIVE_UNRESOLVED')
+                flag('ACADEMIC_GPA_UNCERTAIN')
         if evidence.get('has_courses_in_progress') is True or evidence.get('degree_completed') is False:
             if requirement_status == 'SATISFIED':
                 requirement_status = 'PROVISIONAL'
@@ -210,17 +223,20 @@ def validate_document(
             requirement_status = 'SATISFIED' if (measured_score >= min_score if op == '>=' else measured_score > min_score) else 'BELOW_THRESHOLD'
         else:
             requirement_status = 'REVIEW_REQUIRED'
+    
     else:
-        # ID_PROOF: document-type evidence only; no passport expiry, DOB or number.
+        # DEMO MODE: ID_PROOF is accepted based on detected document type only.
+        # No name matching, authenticity checks, or identity-field validation.
         requirement_status = 'SATISFIED'
-        if evidence.get('verification_status') == 'REVIEW_REQUIRED':
-            flag('IDENTITY_EXTRACTION_UNCERTAIN')
+
+        if dtype == 'ID_PROOF' and detected == 'ID_PROOF':
+            reasons = []
 
     hard_mismatch = any(x in reasons for x in ('DOCUMENT_TYPE_MISMATCH', 'ACADEMIC_LEVEL_MISMATCH',
                                                'DOCUMENT_NOT_ACCEPTED_FOR_PROGRAM', 'NAME_MISMATCH'))
     uncertain = any(x not in ('DOCUMENT_TYPE_MISMATCH', 'ACADEMIC_LEVEL_MISMATCH',
                                'DOCUMENT_NOT_ACCEPTED_FOR_PROGRAM', 'NAME_MISMATCH') for x in reasons)
-    if hard_mismatch and not uncertain:
+    if hard_mismatch:
         verification = 'FAILED'
     elif reasons:
         verification = 'REVIEW_REQUIRED' if uncertain else 'FAILED'
@@ -249,7 +265,7 @@ def validate_document(
         action = 'MANUAL_REVIEW'
     elif requirement_status == 'BELOW_THRESHOLD':
         score_display = measured_score if dtype in EXAMS else evidence.get('overall_gpa') or evidence.get('percentage')
-        message = f'Your {dtype.replace("_", " ")} document was verified, but the reported score ({score_display}) does not meet the program requirement.'
+        message = f'Your {dtype.replace("_", " " )} document was checked, but the reported score ({score_display}) does not meet the program requirement.'
         action = 'REVIEW_ADMISSION_REQUIREMENTS'
     elif requirement_status == 'PROVISIONAL':
         message = 'Your academic record meets the current score requirement. Courses or degree completion remain in progress; an updated final record may be required.'
