@@ -1,277 +1,197 @@
-"""Conservative passport evidence extraction for the Admissions API.
-
-Dependencies: pymupdf, pytesseract, opencv-python, numpy; system Tesseract OCR.
-OCR cannot establish document authenticity. Passport type detection is separate
-from optional applicant-name comparison.
-"""
+"""Passport OCR for Admission Agent. MRZ checks verify transcription, not authenticity."""
 from __future__ import annotations
-
 import re
 import unicodedata
-from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
-
 import cv2
 import fitz
 import numpy as np
 import pytesseract
-from pytesseract import Output
-
 from app.core.admission_document_config import VERIFY_APPLICANT_NAME
 
 
-@dataclass
-class NameCandidate:
-    name: str
-    source: str
-    confidence: float
-
-
 def normalize_name(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value or "")
-    value = "".join(c for c in value if not unicodedata.combining(c))
-    value = value.upper().replace("’", "'")
-    value = re.sub(r"[^A-Z\s'-]", " ", value)
-    value = re.sub(r"[-']", " ", value)
-    return " ".join(value.split())
-
-
-def name_tokens(value: str) -> tuple[str, ...]:
-    return tuple(sorted(normalize_name(value).split()))
+    value = unicodedata.normalize('NFKD', value or '').upper()
+    return ' '.join(re.sub(r'[^A-Z ]', ' ', value).split())
 
 
 def compare_names(extracted: str, expected: str) -> str:
-    """Conservative exact-token matching; OCR mismatches require review."""
-    a, b = name_tokens(extracted), name_tokens(expected)
-    if not a or not b:
-        return "UNCERTAIN"
-    if a == b:
-        return "MATCH"
-    if any(len(t) == 1 for t in a + b):
-        return "UNCERTAIN"
-    if set(a).issubset(set(b)) or set(b).issubset(set(a)):
-        return "UNCERTAIN"
-    return "MISMATCH"
+    a, b = sorted(normalize_name(extracted).split()), sorted(normalize_name(expected).split())
+    if not a or not b: return 'UNCERTAIN'
+    if a == b: return 'MATCH'
+    if set(a).issubset(set(b)) or set(b).issubset(set(a)): return 'UNCERTAIN'
+    return 'MISMATCH'
 
 
-def mrz_candidates(text: str) -> list[NameCandidate]:
+def _check(data: str, digit: str) -> bool:
+    vals = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    total = 0
+    for i, c in enumerate(data):
+        n = 0 if c == '<' else vals.find(c)
+        if n < 0: return False
+        total += n * (7, 3, 1)[i % 3]
+    return digit.isdigit() and total % 10 == int(digit)
+
+
+def _date_yyMMdd(raw: str, *, expiry: bool = False) -> Optional[str]:
+    if not re.fullmatch(r'\d{6}', raw): return None
+    yy, mm, dd = int(raw[:2]), int(raw[2:4]), int(raw[4:])
+    today = date.today()
+    # Expiry year: select a plausible date near present (old and new samples).
+    years = [1900 + yy, 2000 + yy, 2100 + yy]
+    if expiry:
+        years = [y for y in years if today.year - 20 <= y <= today.year + 30]
+    else:
+        years = [y for y in years if today.year - 110 <= y <= today.year]
+    for y in sorted(years, key=lambda y: abs(y - (today.year + (5 if expiry else -30)))):
+        try: return date(y, mm, dd).isoformat()
+        except ValueError: pass
+    return None
+
+
+def _parse_mrz(line1: str, line2: str) -> Optional[dict]:
+    # ICAO TD3 passport MRZ: exactly two lines, 44 characters each.
+    a = re.sub(r'\s+', '', line1.upper())
+    b = re.sub(r'\s+', '', line2.upper())
+    if len(a) != 44 or len(b) != 44 or not re.fullmatch(r'P<[A-Z<]{42}', a):
+        return None
+    if not re.fullmatch(r'[A-Z0-9<]{44}', b): return None
+    if not re.fullmatch(r'[A-Z]{3}', a[2:5]): return None
+    if '<<' not in a[5:]: return None
+    surname, given = a[5:].split('<<', 1)
+    name = normalize_name(given.replace('<', ' ') + ' ' + surname.replace('<', ' '))
+    if len(name.split()) < 2: return None
+    # Check digits on passport number, birth, expiry, and composite field.
+    checks = {
+        'passport_number': _check(b[:9], b[9]),
+        'birth_date': _check(b[13:19], b[19]),
+        'expiry_date': _check(b[21:27], b[27]),
+        'composite': _check(b[:10] + b[13:20] + b[21:43], b[43]),
+    }
+    dob = _date_yyMMdd(b[13:19])
+    expiry = _date_yyMMdd(b[21:27], expiry=True)
+    if not dob or not expiry: return None
+    return {'name': name, 'passport_number': b[:9].rstrip('<'),
+            'nationality': b[10:13], 'date_of_birth': dob,
+            'expiry_date': expiry, 'sex': b[20], 'checks': checks,
+            'mrz_valid': all(checks.values()), 'mrz_line_1': a, 'mrz_line_2': b}
+
+
+def _mrz_lines(text: str) -> list[str]:
+    # Normalize OCR's spaces, but never silently alter check-digit characters.
+    lines = [re.sub(r'\s+', '', x.upper()) for x in text.splitlines()]
+    # Some PDF text layers drop the '<' in the P< passport-type prefix.
+    # Only correct this prefix; full MRZ check digits must still validate.
+    lines = [('P<' + x[2:] if x.startswith('PK') and len(x) == 44 else x) for x in lines]
+    return [x for x in lines if 35 <= len(x) <= 46 and re.fullmatch(r'[A-Z0-9<]+', x)]
+
+
+def _find_mrz(text: str) -> list[dict]:
+    lines = _mrz_lines(text)
     found = []
-    for raw in text.upper().splitlines():
-        line = re.sub(r"\s+", "", raw)
-        if not re.match(r"^P<[A-Z]{3}", line):
-            continue
-        body = line[5:]
-        if "<<" not in body:
-            continue
-        surname, given = body.split("<<", 1)
-        surname = surname.replace("<", " ").strip()
-        given = given.rstrip("<").replace("<", " ").strip()
-        name = normalize_name(f"{given} {surname}")
-        if surname and given and len(name) >= 5:
-            found.append(NameCandidate(name, "MRZ", 0.98 if len(line) == 44 else 0.78))
+    for i, a in enumerate(lines):
+        if not a.startswith('P<'): continue
+        for b in lines[i+1:i+4]:
+            result = _parse_mrz(a, b)
+            if result: found.append(result)
     return found
 
 
-def visual_name_candidates(text: str, confidence: float) -> list[NameCandidate]:
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-    found = []
-    for i, line in enumerate(lines):
-        label = re.search(r"\b(SURNAME|FAMILY NAME|GIVEN NAMES?|FIRST NAME|FULL NAME)\b", line, re.I)
-        if not label:
-            continue
-        field = label.group(1).upper()
-        after = re.sub(r"^.*?\b(?:SURNAME|FAMILY NAME|GIVEN NAMES?|FIRST NAME|FULL NAME)\b", "", line, flags=re.I)
-        after = re.sub(r"^[\s:/-]+", "", after)
-        value = after if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,65}", after) else ""
-        if not value and i + 1 < len(lines):
-            nxt = lines[i + 1]
-            if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,65}", nxt) and not re.search(
-                r"\b(?:NATIONALITY|DATE|PASSPORT|PLACE|SEX|COUNTRY|ISSUE|EXPIRY)\b", nxt, re.I
-            ):
-                value = nxt
-        if value:
-            found.append((field, normalize_name(value)))
-    output = []
-    surnames = [v for k, v in found if k in ("SURNAME", "FAMILY NAME")]
-    given = [v for k, v in found if k in ("GIVEN NAME", "GIVEN NAMES", "FIRST NAME")]
-    for surname in surnames:
-        for given_name in given:
-            output.append(NameCandidate(f"{given_name} {surname}", "VISUAL_FIELDS", confidence))
-    for field, value in found:
-        if field == "FULL NAME":
-            output.append(NameCandidate(value, "VISUAL_FULL_NAME", confidence))
-    return output
+def _ocr(img: np.ndarray, *, mrz: bool = False) -> str:
+    config = ('--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<' if mrz else '--psm 11')
+    return pytesseract.image_to_string(img, config=config)
 
 
-def ocr_image(img: np.ndarray) -> tuple[str, float]:
-    data = pytesseract.image_to_data(img, config="--psm 6", output_type=Output.DICT)
-    scores = []
-    for word, conf in zip(data["text"], data["conf"]):
-        try:
-            score = float(conf)
-        except (TypeError, ValueError):
-            continue
-        if word.strip() and score >= 0:
-            scores.append(score)
-    text = pytesseract.image_to_string(img, config="--psm 6")
-    return text, (sum(scores) / len(scores) / 100 if scores else 0.0)
-
-
-def get_pages(pdf_bytes: bytes, max_pages: int = 3):
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for i in range(min(len(doc), max_pages)):
-            page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
-            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
-            if pix.n == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-            elif pix.n == 1:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            yield page.get_text("text"), img
-
-
-def _passport_mrz_present(text: str) -> bool:
-    """Require plausible TD3 passport MRZ structure, not merely a name."""
-    for raw in text.upper().splitlines():
-        line = re.sub(r"\s+", "", raw)
-        if re.match(r"^P<[A-Z]{3}[A-Z<]{5,39}<<[A-Z<]+", line) and 35 <= len(line) <= 46:
-            return True
-    return False
-
-
-def _passport_visual_present(text: str) -> bool:
-    """Visual labels are supporting evidence; not enough alone for auto-pass."""
-    return bool(
-        re.search(r"\bPASSPORT\b", text, re.I)
-        and re.search(r"\b(?:NATIONALITY|DATE OF BIRTH|PASSPORT NO|PASSPORT NUMBER)\b", text, re.I)
-    )
+def _page_images(page: fitz.Page):
+    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+    arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4: arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+    if pix.n == 1: arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    yield arr
+    # A passport scan may be upside down or sideways.
+    yield cv2.rotate(arr, cv2.ROTATE_180)
+    yield cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+    yield cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
 def extract_identity_document(pdf_bytes: bytes, applicant_name: Optional[str] = None) -> dict:
-    """Extract passport evidence, optionally compare names based on configuration.
-
-    A reliable passport MRZ or corroborated visual markers identify the document
-    type, but never prove issuer authenticity or identity ownership.
-    """
-    name_enabled = VERIFY_APPLICANT_NAME
-    if name_enabled and not normalize_name(applicant_name or ""):
-        raise ValueError("Salesforce applicant name is required when name verification is enabled")
-
-    candidates: list[NameCandidate] = []
-    mrz_seen = False
-    visual_observations = 0
-    text_seen = False
-    confidences: list[float] = []
+    name_enabled = bool(VERIFY_APPLICANT_NAME)
+    if name_enabled and not normalize_name(applicant_name or ''):
+        raise ValueError('Salesforce applicant name is required when name verification is enabled')
+    observations, warnings, mrz_results = [], [], []
     try:
-        pages = list(get_pages(pdf_bytes))
-    except Exception:
-        return {
-            "document_type": "ID_PROOF",
-            "detected_document_type": None,
-            "extraction_status": "REVIEW_REQUIRED",
-            "verification_status": "REVIEW_REQUIRED",
-            "reason_code": "UNREADABLE_DOCUMENT",
-            "warnings": ["Could not read the identity document"],
-            "name_match": None,
-            "name_match_status": "REVIEW_REQUIRED" if name_enabled else "SKIPPED",
-            "issuer_authenticity_verified": False,
-        }
+        with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
+            for page in list(doc)[:3]:
+                embedded = page.get_text('text', sort=True)
+                observations.append(embedded)
+                mrz_results.extend(_find_mrz(embedded))
+                # If embedded text already provides a checksum-valid MRZ, no OCR is necessary.
+                if any(r['mrz_valid'] for r in mrz_results): continue
+                for img in _page_images(page):
+                    try:
+                        full = _ocr(img)
+                        observations.append(full)
+                        mrz_results.extend(_find_mrz(full))
+                        if any(r['mrz_valid'] for r in mrz_results): break
+                        # MRZ typically occupies the bottom of the identity page.
+                        for start in (0.72, 0.82):
+                            strip = img[int(img.shape[0] * start):]
+                            gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
+                            gray = cv2.resize(gray, None, fx=1.5, fy=1.5)
+                            for thresholded in (gray, cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]):
+                                mrz_results.extend(_find_mrz(_ocr(thresholded, mrz=True)))
+                                if any(r['mrz_valid'] for r in mrz_results): break
+                            if any(r['mrz_valid'] for r in mrz_results): break
+                    except (pytesseract.TesseractError, RuntimeError, OSError) as exc:
+                        warnings.append(f'OCR unavailable: {type(exc).__name__}')
+                    if any(r['mrz_valid'] for r in mrz_results): break
+    except (fitz.FileDataError, ValueError, RuntimeError) as exc:
+        warnings.append(f'Unable to read PDF: {type(exc).__name__}')
 
-    for embedded, img in pages:
-        observations = []
-        if embedded.strip():
-            observations.append((embedded, 0.90))
-        for rotation in (0, 180):
-            frame = cv2.rotate(img, cv2.ROTATE_180) if rotation else img
-            try:
-                text, confidence = ocr_image(frame)
-            except (pytesseract.TesseractError, RuntimeError, OSError):
-                text, confidence = "", 0.0
-            if text.strip():
-                observations.append((text, confidence))
-                confidences.append(confidence)
-            try:
-                strip = frame[int(frame.shape[0] * 0.84):]
-                gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
-                mrz_text = pytesseract.image_to_string(
-                    gray, config="--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
-                )
-                if mrz_text.strip():
-                    observations.append((mrz_text, confidence))
-            except (pytesseract.TesseractError, RuntimeError, OSError):
-                pass
-
-        for text, confidence in observations:
-            text_seen = True
-            mrz_seen |= _passport_mrz_present(text)
-            if _passport_visual_present(text):
-                visual_observations += 1
-            if name_enabled:
-                candidates.extend(mrz_candidates(text))
-                candidates.extend(visual_name_candidates(text, confidence))
-
-    # A plausible MRZ is strong evidence of passport type. Visual-only detection
-    # remains reviewable because a header/labels alone can be misleading.
-    detected_type = "ID_PROOF" if mrz_seen else None
-    warnings = []
-    if not mrz_seen:
-        warnings.append("Passport MRZ not confidently identified; manual document-type review required")
-    if not text_seen:
-        warnings.append("No readable document text detected")
-
-    name_match = None
-    name_status = "SKIPPED" if not name_enabled else "REVIEW_REQUIRED"
-    if name_enabled:
-        good = [c for c in candidates if c.confidence >= 0.80 and len(name_tokens(c.name)) >= 2]
-        matches = [c for c in good if compare_names(c.name, applicant_name or "") == "MATCH"]
-        distinct = {name_tokens(c.name) for c in good}
-        has_mrz = any(c.source == "MRZ" and c.confidence >= 0.90 for c in good)
-        if matches and len(distinct) == 1 and (has_mrz or len(matches) >= 2):
-            name_match, name_status = True, "MATCH"
-        else:
-            warnings.append("Passport applicant name could not be reliably confirmed")
-
-    extracted_ok = bool(mrz_seen and (not name_enabled or name_match is True))
+    valid = next((r for r in mrz_results if r['mrz_valid']), None)
+    best = valid or (mrz_results[0] if mrz_results else None)
+    name_status = 'SKIPPED' if not name_enabled else ('MATCH' if valid and compare_names(valid['name'], applicant_name or '') == 'MATCH' else 'REVIEW_REQUIRED')
+    if not valid: warnings.append('No checksum-valid TD3 passport MRZ could be extracted')
+    if name_enabled and name_status != 'MATCH': warnings.append('Applicant name requires manual verification')
+    # Never automatically pass an expired passport.
+    not_expired = bool(valid and valid['expiry_date'] >= date.today().isoformat())
+    if valid and not not_expired: warnings.append('Passport is expired')
+    passed = bool(valid and not_expired and (not name_enabled or name_status == 'MATCH'))
     return {
-        "document_type": "ID_PROOF",
-        "detected_document_type": detected_type,
-        "detected_document_type_match": True if mrz_seen else None,
-        "extraction_status": "EXTRACTED" if extracted_ok else "REVIEW_REQUIRED",
-        "verification_status": "PASSED" if extracted_ok else "REVIEW_REQUIRED",
-        "reason_code": "PASSPORT_TYPE_DETECTED" if mrz_seen else "DOCUMENT_TYPE_UNCERTAIN",
-        "warnings": warnings,
-        "name_match": name_match,
-        "name_match_status": name_status,
-        "passport_mrz_detected": mrz_seen,
-        "passport_visual_markers_detected": visual_observations > 0,
-        "ocr_confidence": round(max(confidences) * 100, 2) if confidences else None,
-        "issuer_authenticity_verified": False,
+        'document_type': 'ID_PROOF',
+        'detected_document_type': 'ID_PROOF' if best else None,
+        'detected_document_type_match': True if best else None,
+        'extraction_status': 'EXTRACTED' if passed else 'REVIEW_REQUIRED',
+        'verification_status': 'PASSED' if passed else 'REVIEW_REQUIRED',
+        'reason_code': 'PASSPORT_MRZ_VALIDATED' if valid else 'DOCUMENT_TYPE_UNCERTAIN',
+        'warnings': list(dict.fromkeys(warnings)),
+        'name_match': True if name_status == 'MATCH' else None,
+        'name_match_status': name_status,
+        'passport_mrz_detected': bool(best),
+        'passport_mrz_checksum_valid': bool(valid),
+        'passport_visual_markers_detected': bool(re.search(r'PASSPORT|REPUBLIC OF|NATIONALITY', '\n'.join(observations), re.I)),
+        'passport_number': best['passport_number'] if best else None,
+        'student_name': best['name'] if best else None,
+        'nationality': best['nationality'] if best else None,
+        'date_of_birth': best['date_of_birth'] if best else None,
+        'expiry_date': best['expiry_date'] if best else None,
+        'mrz_check_results': best['checks'] if best else None,
+        'issuer_authenticity_verified': False,
     }
 
 
 def verify_passport_name(pdf_bytes: bytes, applicant_name: Optional[str] = None) -> dict:
-    """Backward-compatible entry point; respects VERIFY_APPLICANT_NAME."""
     result = extract_identity_document(pdf_bytes, applicant_name)
-    status = result["verification_status"]
-    if result["name_match_status"] == "SKIPPED":
-        message = ("Passport type was detected; applicant name verification was skipped."
-                   if status == "PASSED" else
-                   "Passport type could not be confirmed automatically; manual review required.")
-    elif result["name_match"] is True and status == "PASSED":
-        message = "The name on your passport matches the name on your application."
-    else:
-        message = "We could not confidently verify the passport and applicant name; manual review required."
-    return {**result, "message": message,
-            "action_required": "NONE" if status == "PASSED" else "MANUAL_REVIEW"}
+    return {**result, 'message': ('Passport MRZ validated; issuer authenticity not verified.' if result['verification_status'] == 'PASSED' else 'Passport requires manual review.'),
+            'action_required': 'NONE' if result['verification_status'] == 'PASSED' else 'MANUAL_REVIEW'}
 
 
-if __name__ == "__main__":
-    import argparse
-    import json
-
+if __name__ == '__main__':
+    import argparse, json
     parser = argparse.ArgumentParser()
-    parser.add_argument("pdf")
-    parser.add_argument("--applicant-name")
+    parser.add_argument('pdf')
+    parser.add_argument('--applicant-name')
     args = parser.parse_args()
     print(json.dumps(verify_passport_name(Path(args.pdf).read_bytes(), args.applicant_name), indent=2))

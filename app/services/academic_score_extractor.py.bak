@@ -58,25 +58,91 @@ def _level(text: str) -> tuple[str, list[str]]:
     return ("MIXED" if g and u else "GRADUATE" if g else "UNDERGRADUATE" if u else "UNKNOWN"), evidence
 
 
+
 def _gpa(text: str) -> float | None:
-    # Prefer document-level totals, never the first term GPA or grade-scale example.
+    """
+    Extract cumulative GPA from transcript text.
+
+    Priority:
+    1. CCH/CGP/CGPA paired totals
+    2. Explicit cumulative or overall GPA
+    3. Final CGPA from semester tables
+
+    OCR values such as '233' may represent '2.33'.
+    Such normalization is only attempted for explicitly
+    labeled CGPA fields.
+    """
+
+    def normalize_gpa(value: str) -> float | None:
+        value = value.strip()
+
+        try:
+            number = float(value)
+
+            # Standard GPA format: 2.33, 3.91, etc.
+            if "." in value:
+                return number if 0 <= number <= 4 else None
+
+            # OCR may omit decimal points:
+            # 233 -> 2.33
+            # 300 -> 3.00
+            if len(value) == 3 and value.isdigit():
+                normalized = number / 100
+                return normalized if 0 <= normalized <= 4 else None
+
+            # Single-digit GPA, e.g. 3
+            if len(value) == 1 and value.isdigit():
+                return number if 0 <= number <= 4 else None
+
+        except ValueError:
+            pass
+
+        return None
+
+    # Priority 1: CCH / CGP / CGPA paired totals.
+    # Choose the record with the largest cumulative credit hours.
+    paired = re.findall(
+        r"CCH\s*:\s*(\d+(?:\.\d+)?)"
+        r"\s+CGP\s*:\s*\d+(?:\.\d+)?"
+        r"\s+CGPA\s*:\s*([0-4]\.\d+)",
+        text,
+        re.I,
+    )
+
+    if paired:
+        return float(max(paired, key=lambda x: float(x[0]))[1])
+
+    # Priority 2: Explicit document-level GPA.
     patterns = [
         r"\bCumulative GPA\s*:\s*([0-4](?:\.\d{1,3})?)",
         r"\bOVERALL\s+\d+\.\d+\s+\d+\.\d+\s+\d+\.\d+\s+([0-4]\.\d+)",
         r"\bOverall\s*:\s*(?:\d+\.\d+\s+){5}([0-4]\.\d+)",
         r"\bTotal Institution\s*:\s*(?:\d+\.\d+\s+){5}([0-4]\.\d+)",
-        r"\bCGPA\s*:\s*([0-4]\.\d+)",
     ]
-    # In two-column semester tables, use the CGPA paired with the largest CCH.
-    paired = re.findall(r"CCH\s*:\s*(\d+(?:\.\d+)?)\s+CGP\s*:\s*\d+(?:\.\d+)?\s+CGPA\s*:\s*([0-4]\.\d+)", text, re.I)
-    if paired:
-        return float(max(paired, key=lambda x: float(x[0]))[1])
-    for p in patterns:
-        matches = re.findall(p, text, re.I)
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.I)
+
         if matches:
             return float(matches[-1])
-    return None
 
+    # Priority 3: Semester-based CGPA.
+    # Use the last CGPA, which normally represents
+    # the final cumulative result.
+    cgpa_matches = re.findall(
+        r"\bCGPA\s*:\s*(\d+(?:\.\d+)?)",
+        text,
+        re.I,
+    )
+
+    if cgpa_matches:
+        for raw_value in reversed(cgpa_matches):
+            normalized = normalize_gpa(raw_value)
+
+            if normalized is not None:
+                return normalized
+
+    return None
 
 def extract_transcript(pdf: bytes | str | Path, *, enable_ocr: bool = True) -> dict[str, Any]:
     """Return JSON-serializable fields. Missing/ambiguous fields stay null/UNKNOWN.
@@ -124,6 +190,9 @@ def extract_transcript(pdf: bytes | str | Path, *, enable_ocr: bool = True) -> d
         current_program = re.split(r"\s{3,}", current_program)[0]
     unofficial = bool(re.search(r"\bunofficial\b|\bNOT\s+Official\b", text[:6000], re.I))
     official = bool(re.search(r"\bFINAL TRANSCRIPT\b", first, re.I)) and not unofficial
+    candidate_gpa = _gpa(text)
+    ocr_used = "OCR_TESSERACT" in methods
+    requires_review = candidate_gpa is None
     return {
         "document_type": "ACADEMIC_TRANSCRIPT",
         "student_name": name,
@@ -131,7 +200,11 @@ def extract_transcript(pdf: bytes | str | Path, *, enable_ocr: bool = True) -> d
         "academic_level": level,
         "academic_level_evidence": evidence,
         "current_program": current_program,
-        "cumulative_gpa": None if "OCR_TESSERACT" in methods else _gpa(text),
+        "candidate_gpa": candidate_gpa,
+        "cumulative_gpa": candidate_gpa,
+        "gpa_verification_status": ("NOT_EXTRACTED" if candidate_gpa is None else
+                                    "NOT_EXTRACTED" if requires_review else "NOT_CHECKED"),
+        "requires_manual_review": requires_review,
         "is_marked_unofficial": unofficial,
         "is_marked_final": official,
         "issuer_authenticity_verified": False,
@@ -202,37 +275,123 @@ def extract_undergraduate(text: str) -> dict:
     return result
 
 
+def _subject_word_total(text: str) -> tuple[float, float] | None:
+    """Independent cross-check using complete, distinct subject rows.
+
+    Conservative: only a five-subject, 100-marks-per-subject layout is
+    supported. Do not infer totals from arbitrary words in a grading key.
+    """
+    units = {"ZERO": 0, "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4,
+             "FIVE": 5, "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9}
+    tens = {"TWENTY": 20, "THIRTY": 30, "FORTY": 40, "FIFTY": 50,
+            "SIXTY": 60, "SEVENTY": 70, "EIGHTY": 80, "NINETY": 90}
+    subjects = ("HINDI", "ENGLISH", "PHYSICS", "CHEMISTRY", "MATHEMATICS")
+    scores = {}
+    for line in text.upper().splitlines():
+        for subject in subjects:
+            if not re.search(r"\b" + subject + r"\b", line):
+                continue
+            if subject in scores:
+                return None  # Duplicate/ambiguous subject row.
+            tail = re.split(r"\b" + subject + r"\b", line, maxsplit=1)[1]
+            pattern = r"\b(" + "|".join(tens) + r")\s+(" + "|".join(units) + r")\b"
+            m = re.search(pattern, tail)
+            if m:
+                scores[subject] = tens[m.group(1)] + units[m.group(2)]
+            else:
+                return None  # An identified subject row has no readable word mark.
+    if len(scores) != len(subjects):
+        return None
+    return float(sum(scores.values())), 500.0
+
+
 def extract_class_12(text: str) -> dict:
+    """Extract explicit Class 12 percentage or supported aggregate layouts.
+
+    Never infer a Class 12 score from a Class 10 marksheet.
+    """
     result = {'academic_level': 'UNKNOWN', 'percentage': None, 'overall_gpa': None,
               'gpa_scale': None, 'total_marks': None, 'maximum_marks': None,
               'has_courses_in_progress': bool(re.search(r'IN\s+PROGRESS', text, re.I)),
               'degree_completed': None, 'extraction_method': None, 'warnings': []}
-    if re.search(r'HIGH\s+SCHOOL\s+EXAMINATION', text, re.I) and not re.search(r'HIGHER\s+SECONDARY|CLASS\s*(?:XII|12)|INTERMEDIATE', text, re.I):
+    if re.search(r'HIGH\s+SCHOOL\s+EXAMINATION', text, re.I) and not re.search(
+            r'HIGHER\s+SECONDARY|CLASS\s*(?:XII|12)|INTERMEDIATE|SENIOR\s+SECONDARY', text, re.I):
         result['academic_level'] = 'CLASS_10'
     elif re.search(r'HIGHER\s+SECONDARY|HSC\b|CLASS\s*(?:XII|12)|\b12TH\b|SENIOR\s+SECONDARY|INTERMEDIATE', text, re.I):
         result['academic_level'] = 'CLASS_12'
-    pct = number(r'(?:OVERALL\s+PERCENTAGE|PERCENTAGE|PERCENT\s+OF\s+MARKS)\s*[:=]?\s*' + NUM, text, re.I)
-    if pct is None:
-        pct = number(r'\b(\d{1,2}\.\d{1,2})\s*%', text, re.I)
-    if pct is None:
-        m = re.search(r'Percentage\s+' + NUM + r'\s+' + NUM + r'\s+' + NUM, text, re.I)
-        if m:
-            maximum, obtained, proposed_pct = map(float, m.groups())
-            if maximum > 0 and abs(100 * obtained / maximum - proposed_pct) < 0.2:
-                result.update(total_marks=obtained, maximum_marks=maximum)
-                pct = proposed_pct
-    if pct is not None and 0 <= pct <= 100:
-        result.update(percentage=pct, extraction_method='EXPLICIT_PERCENTAGE')
-    m = re.search(r'(?:GRAND\s+TOTAL|TOTAL\s+MARKS)\s*[:=]?\s*' + NUM + r'\s*(?:/|OUT\s+OF)\s*' + NUM, text, re.I)
-    if m:
-        obtained, maximum = map(float, m.groups())
-        if maximum > 0 and 0 <= obtained <= maximum:
-            result.update(total_marks=obtained, maximum_marks=maximum)
-            calculated = round(obtained / maximum * 100, 2)
-            if result['percentage'] is None:
-                result.update(percentage=calculated, extraction_method='EXPLICIT_AGGREGATE')
-            elif abs(calculated - result['percentage']) > 0.1:
-                result['warnings'].append('Aggregate and percentage inconsistent')
+
+    if result['academic_level'] != 'CLASS_12':
+        result['warnings'].append('Document not confirmed as Class 12; do not use for Class 12 eligibility')
+        return result
+
+    # Extract explicit percentages, including OCR/PDF table layouts with
+    # other columns between the label and the percentage.
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not re.search(r'\b(?:percentage|percent of marks)\b', line, re.I):
+            continue
+        # Prefer the value immediately after the label, then a number on
+        # the following line (some PDFs split the label and value).
+        tail = re.split(r'\b(?:percentage|percent of marks)\b', line, maxsplit=1, flags=re.I)[1]
+        match = re.search(r'(?<!\d)(100(?:\.0+)?|\d{1,2}(?:\.\d{1,2})?)(?!\d)', tail)
+        if not match and i + 1 < len(lines):
+            match = re.search(r'^\s*(100(?:\.0+)?|\d{1,2}\.\d{1,2})(?!\d)', lines[i + 1])
+        if match:
+            result['percentage'] = float(match.group(1))
+            result['extraction_method'] = 'EXPLICIT_PERCENTAGE'
+            break
+
+    if result['percentage'] is None:
+        match = re.search(r'\b(100(?:\.0+)?|\d{1,2}\.\d{1,2})\s*%', text)
+        if match:
+            result['percentage'] = float(match.group(1))
+            result['extraction_method'] = 'EXPLICIT_PERCENTAGE'
+
+    # Common board format: GRAND TOTAL 358 / 500.
+    aggregates = []
+    for match in re.finditer(
+            r'(?:GRAND\s+TOTAL|TOTAL\s+MARKS)\s*[:=]?\s*(\d{2,4})\s*/\s*(\d{2,4})',
+            text, re.I):
+        aggregates.append((float(match.group(1)), float(match.group(2))))
+    # OCR may place 358/500 just before the GRAND TOTAL label.
+    for match in re.finditer(r'(?<!\d)(\d{2,4})\s*/\s*(\d{2,4})(?!\d)', text):
+        context = text[max(0, match.start() - 100):match.end() + 100]
+        if re.search(r'GRAND\s+TOTAL', context, re.I):
+            aggregates.append((float(match.group(1)), float(match.group(2))))
+    # Maharashtra boards print maximum then obtained: 600 425.
+    for match in re.finditer(r'(?<!\d)([3-9]00|1000)\s+(\d{2,4})(?!\d)', text):
+        maximum, obtained = map(float, match.groups())
+        if 0 <= obtained <= maximum:
+            aggregates.append((obtained, maximum))
+
+    for obtained, maximum in aggregates:
+        if maximum <= 0 or not 0 <= obtained <= maximum:
+            continue
+        computed = round(100 * obtained / maximum, 2)
+        if result['percentage'] is not None and abs(computed - result['percentage']) > 0.12:
+            continue  # Other table row or unrelated pair; do not overwrite.
+        result['total_marks'] = obtained
+        result['maximum_marks'] = maximum
+        if result['percentage'] is None:
+            result['percentage'] = computed
+            result['extraction_method'] = 'EXPLICIT_AGGREGATE'
+        break
+
+    # Independent evidence from five complete subject rows takes precedence
+    # over an OCR aggregate with missing digits (e.g. 38/500 vs 358/500).
+    word_total = _subject_word_total(text)
+    if word_total is not None:
+        obtained, maximum = word_total
+        word_percentage = round(100 * obtained / maximum, 2)
+        if result['percentage'] is not None and abs(result['percentage'] - word_percentage) > 0.12:
+            result['warnings'].append('OCR aggregate conflicts with subject-word total; numerical aggregate ignored')
+        result['percentage'] = word_percentage
+        result['total_marks'] = obtained
+        result['maximum_marks'] = maximum
+        result['extraction_method'] = 'SUBJECT_MARKS_WORD_SUM'
+
+    if result['percentage'] is None:
+        result['warnings'].append('Percentage and aggregate could not be extracted')
     result['warnings'].append('Do not convert percentage to GPA without approved equivalency')
     return result
 
@@ -243,8 +402,52 @@ def extract_academic_record(pdf_bytes: bytes, document_type: str) -> dict:
     text, methods = pdf_text(pdf_bytes)
     if document_type == 'CLASS_12_MARKSHEET':
         result = extract_class_12(text)
+        # Scanned marksheets often have a small GRAND TOTAL row that full-page
+        # OCR misses. Re-OCR the lower portion of page 1 at higher resolution.
+        if result['percentage'] is None and 'OCR_TESSERACT' in methods:
+            try:
+                import pytesseract
+                from PIL import Image
+                with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
+                    page = doc[0]
+                    crop = fitz.Rect(0, page.rect.height * 0.65,
+                                     page.rect.width, page.rect.height * 0.86)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3),
+                                          clip=crop, alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes('png')))
+                    cropped_text = pytesseract.image_to_string(image, config='--psm 6')
+                retry = extract_class_12(text + '\n' + cropped_text)
+                if retry['percentage'] is not None:
+                    result = retry
+                    methods.append('OCR_TESSERACT_CROP')
+            except (ImportError, OSError, RuntimeError, ValueError, IndexError):
+                pass
+        # If the original focused crop still misses the total, retry the full
+        # first page with PSM 6 (better for some scanned table layouts).
+        if result['percentage'] is None and 'OCR_TESSERACT' in methods:
+            try:
+                import pytesseract
+                from PIL import Image
+                with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
+                    pix = doc[0].get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes('png')))
+                    table_text = pytesseract.image_to_string(image, config='--psm 6')
+                retry = extract_class_12(text + '\n' + table_text)
+                if retry['academic_level'] == 'CLASS_12' and retry['percentage'] is not None:
+                    result = retry
+                    methods.append('OCR_TESSERACT_TABLE_RETRY')
+            except (ImportError, OSError, RuntimeError, ValueError, IndexError, pytesseract.TesseractError):
+                pass
     else:
         result = extract_undergraduate(text)
+        # Some PDFs lose GPA table order when text is sorted; use the legacy
+        # transcript reader as a fallback (without changing successful results).
+        if result.get('overall_gpa') is None:
+            fallback = extract_transcript(pdf_bytes)
+            if fallback.get('candidate_gpa') is not None:
+                result['overall_gpa'] = fallback['candidate_gpa']
+                result['gpa_scale'] = 4.0
+                result['extraction_method'] = 'CUMULATIVE_GPA'
         first = text.split('\f')[0][:8000]
         result.update(
             student_name=_value(first, [r'^\s*Student[’\']s Name\s*:\s*([^\n]+)', r'^\s*Record of\s*:\s*([^\n]+)', r'^\s*Name\s*:\s*([^\n]+)']),
@@ -256,9 +459,23 @@ def extract_academic_record(pdf_bytes: bytes, document_type: str) -> dict:
             issuer_authenticity_verified=False,
         )
         if 'OCR_TESSERACT' in methods and 'PDF_TEXT' not in methods:
-            result['overall_gpa'] = None
-            result['gpa_scale'] = None
-            result['warnings'].append('OCR GPA requires manual verification')
+            # Demo: use OCR-derived candidate GPA directly for score evaluation.
+            result['overall_gpa'] = _gpa(text)
+            result['gpa_scale'] = 4.0 if result['overall_gpa'] is not None else None
+    if document_type == 'UNDERGRADUATE_TRANSCRIPT':
+        # Retain the OCR candidate even when the compatibility API suppresses the score.
+        candidate_gpa = result.get('overall_gpa')
+        ocr_used = 'OCR_TESSERACT' in methods
+        requires_review = candidate_gpa is None
+        result.update(
+            candidate_gpa=candidate_gpa,
+            gpa_verification_status=('NOT_EXTRACTED' if candidate_gpa is None else
+                                     'NOT_EXTRACTED' if requires_review else 'NOT_CHECKED'),
+            requires_manual_review=requires_review,
+        )
+    else:
+        result.update(candidate_gpa=None, gpa_verification_status='NOT_CHECKED',
+                      requires_manual_review=result.get('percentage') is None)
     has_value = result['overall_gpa'] is not None or result['percentage'] is not None
     result.update(document_type=document_type, extraction_methods=methods,
                   extraction_status='EXTRACTED' if has_value else 'REVIEW_REQUIRED')

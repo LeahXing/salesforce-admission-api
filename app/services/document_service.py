@@ -886,14 +886,35 @@ def upload_and_verify_document(
     program = _customer_program(customer)
     applicant_name = ""  # Demo: name matching disabled for every document type
     try:
-        extracted = _extract_document(file_content, dtype, applicant_name)
+        print("\n[UPLOAD DEBUG] Starting extraction", flush=True)
+        print("[UPLOAD DEBUG] Document type:", dtype, flush=True)
+        print("[UPLOAD DEBUG] File size:", len(file_content), flush=True)
+
+        extracted = _extract_document(
+            file_content,
+            dtype,
+            applicant_name
+        )
+
+        print("[UPLOAD DEBUG] Extracted result:", extracted, flush=True)
+
     except Exception as exc:
-        # OCR/parser failures are reviewable, never proof of an invalid document.
-        extracted = {"extraction_status": "REVIEW_REQUIRED", "warnings": [f"Extraction error: {type(exc).__name__}"],
-                     "document_type": dtype}
+        import traceback
+
+        print("[UPLOAD DEBUG] EXTRACTION FAILED:", repr(exc), flush=True)
+        traceback.print_exc()
+
+        extracted = {
+            "extraction_status": "REVIEW_REQUIRED",
+            "warnings": [
+                f"Extraction error: {type(exc).__name__}"
+            ],
+            "document_type": dtype
+        }
     validation = validate_document(document_type=dtype, applicant_name=applicant_name,
                                    extracted_data=extracted, program=program,
                                    verify_applicant_name=False)
+    print("[UPLOAD DEBUG] Validation result:", validation, flush=True)
     if extracted.get("extraction_status") == "REVIEW_REQUIRED" and validation["verification_status"] == "PASSED":
         validation["verification_status"] = "REVIEW_REQUIRED"
         validation["reason_codes"] = list(dict.fromkeys(validation["reason_codes"] + ["EXTRACTION_UNCERTAIN"]))

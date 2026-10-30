@@ -275,6 +275,36 @@ def extract_undergraduate(text: str) -> dict:
     return result
 
 
+def _subject_word_total(text: str) -> tuple[float, float] | None:
+    """Independent cross-check using complete, distinct subject rows.
+
+    Conservative: only a five-subject, 100-marks-per-subject layout is
+    supported. Do not infer totals from arbitrary words in a grading key.
+    """
+    units = {"ZERO": 0, "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4,
+             "FIVE": 5, "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9}
+    tens = {"TWENTY": 20, "THIRTY": 30, "FORTY": 40, "FIFTY": 50,
+            "SIXTY": 60, "SEVENTY": 70, "EIGHTY": 80, "NINETY": 90}
+    subjects = ("HINDI", "ENGLISH", "PHYSICS", "CHEMISTRY", "MATHEMATICS")
+    scores = {}
+    for line in text.upper().splitlines():
+        for subject in subjects:
+            if not re.search(r"\b" + subject + r"\b", line):
+                continue
+            if subject in scores:
+                return None  # Duplicate/ambiguous subject row.
+            tail = re.split(r"\b" + subject + r"\b", line, maxsplit=1)[1]
+            pattern = r"\b(" + "|".join(tens) + r")\s+(" + "|".join(units) + r")\b"
+            m = re.search(pattern, tail)
+            if m:
+                scores[subject] = tens[m.group(1)] + units[m.group(2)]
+            else:
+                return None  # An identified subject row has no readable word mark.
+    if len(scores) != len(subjects):
+        return None
+    return float(sum(scores.values())), 500.0
+
+
 def extract_class_12(text: str) -> dict:
     """Extract explicit Class 12 percentage or supported aggregate layouts.
 
@@ -347,6 +377,19 @@ def extract_class_12(text: str) -> dict:
             result['extraction_method'] = 'EXPLICIT_AGGREGATE'
         break
 
+    # Independent evidence from five complete subject rows takes precedence
+    # over an OCR aggregate with missing digits (e.g. 38/500 vs 358/500).
+    word_total = _subject_word_total(text)
+    if word_total is not None:
+        obtained, maximum = word_total
+        word_percentage = round(100 * obtained / maximum, 2)
+        if result['percentage'] is not None and abs(result['percentage'] - word_percentage) > 0.12:
+            result['warnings'].append('OCR aggregate conflicts with subject-word total; numerical aggregate ignored')
+        result['percentage'] = word_percentage
+        result['total_marks'] = obtained
+        result['maximum_marks'] = maximum
+        result['extraction_method'] = 'SUBJECT_MARKS_WORD_SUM'
+
     if result['percentage'] is None:
         result['warnings'].append('Percentage and aggregate could not be extracted')
     result['warnings'].append('Do not convert percentage to GPA without approved equivalency')
@@ -378,6 +421,22 @@ def extract_academic_record(pdf_bytes: bytes, document_type: str) -> dict:
                     result = retry
                     methods.append('OCR_TESSERACT_CROP')
             except (ImportError, OSError, RuntimeError, ValueError, IndexError):
+                pass
+        # If the original focused crop still misses the total, retry the full
+        # first page with PSM 6 (better for some scanned table layouts).
+        if result['percentage'] is None and 'OCR_TESSERACT' in methods:
+            try:
+                import pytesseract
+                from PIL import Image
+                with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
+                    pix = doc[0].get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes('png')))
+                    table_text = pytesseract.image_to_string(image, config='--psm 6')
+                retry = extract_class_12(text + '\n' + table_text)
+                if retry['academic_level'] == 'CLASS_12' and retry['percentage'] is not None:
+                    result = retry
+                    methods.append('OCR_TESSERACT_TABLE_RETRY')
+            except (ImportError, OSError, RuntimeError, ValueError, IndexError, pytesseract.TesseractError):
                 pass
     else:
         result = extract_undergraduate(text)
